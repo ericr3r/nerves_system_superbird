@@ -14,6 +14,14 @@ in the [ericr3r/notes-superbird repository](https://github.com/ericr3r/notes-sup
 
 ## Using
 
+Add `superbird` to `@all_targets` and
+```
+{:nerves_system_superbird, git: "git@github.com:ericr3r/nerves_system_superbird.git", 
+runtime: false, tag: ..., targets: :superbird}
+```
+to `deps` in `mix.exs`.
+ 
+
 The most common way of using this Nerves System is create a project with `mix
 nerves.new` and to export `MIX_TARGET=superbird`. See the [Getting started
 guide](https://hexdocs.pm/nerves/getting-started.html#creating-a-new-nerves-app)
