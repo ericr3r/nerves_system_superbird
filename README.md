@@ -6,6 +6,12 @@ This is the base Nerves System configuration for the Spotify:tm: Car Thing.
 
 Networking is only done through [Gadget Mode](http://www.linux-usb.org/gadget/).
 
+## Intial bootsrapping
+
+The initial steps to get a nerves release onto the Spotify:tm: Car Things are complicated.
+Please refer to the [instructions](https://github.com/ericr3r/notes-superbird/bootsrapping.md)
+in the [ericr3r/notes-superbird repository](https://github.com/ericr3r/notes-superbird).
+
 ## Using
 
 The most common way of using this Nerves System is create a project with `mix
