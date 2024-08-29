@@ -19,6 +19,7 @@ jobs:
       - name: Setup cache
         id: cache-buildroot-downloads
         uses: actions/cache@v3
+        if: ${{ !github.event.act }} # skip during local actions testing
         with:
           path: _build/dl
           key: buildroot-${{ hashFiles('mix.lock') }}
@@ -32,8 +33,6 @@ jobs:
 
       - name: Install nerves_bootstrap
         run: |
-          cat /home/nerves/.bashrc
-          ls /usr/local/elixir/bin
           sudo -i -u nerves echo \$PATH
           sudo -i -u nerves echo \$SHELL
           sudo -i -u nerves mix local.hex --force
@@ -42,19 +41,19 @@ jobs:
 
       - name: Create artifact dir 
         run: |
-          sudo  -i -u nerves mkdir -p deploy/system/artifacts
+          sudo  -i -u nerves mkdir -p /home/nerves/deploy/system/artifacts
 
       - name: Build
         run: |
           sudo -i -u nerves sh -c "cd $GITHUB_WORKSPACE; mix deps.get"
-          sudo -i -u nerves sh -c "cd $GITHUB_WORKSPACE; mix nerves.artifact --path $GITHUB_WORKSPACE/deploy/system/artifacts"
+          sudo -i -u nerves sh -c "cd $GITHUB_WORKSPACE; mix nerves.artifact --path /home/nerves/deploy/system/artifacts"
 
       - name: Upload Artifacts and Create Release
         if: contains(github.ref, 'tags')
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: deploy/system/artifacts/*
+          file: /home/nerves/deploy/system/artifacts/*
           file_glob: true
           tag: ${{ github.ref }}
 
