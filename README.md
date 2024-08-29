@@ -9,7 +9,7 @@ Networking is only done through [Gadget Mode](http://www.linux-usb.org/gadget/).
 ## Intial bootsrapping
 
 The initial steps to get a nerves release onto the Spotify:tm: Car Things are complicated.
-Please refer to the [instructions](https://github.com/ericr3r/notes-superbird/bootsrapping.md)
+Please refer to the [bootstrap instructions](https://github.com/ericr3r/notes-superbird/bootsrapping.md)
 in the [ericr3r/notes-superbird repository](https://github.com/ericr3r/notes-superbird).
 
 ## Using
