@@ -31,18 +31,19 @@ jobs:
 
       - name: Install nerves_bootstrap
         run: |
-          mix local.hex --force
-          mix local.rebar --force
-          mix archive.install hex nerves_bootstrap $NERVES_BOOTSTRAP_VERSION --force
+          sudo -u nerves mix local.hex --force
+          sudo -u nerves mix local.rebar --force
+          sudo -u nerves mix archive.install hex nerves_bootstrap $NERVES_BOOTSTRAP_VERSION --force
 
       - name: Create artifact dir 
         run: |
-          mkdir -p deploy/system/artifacts
+          sudo chown -R nerves:nerves $GITHUB_WORKSPACE
+          sudo -u nerves mkdir -p deploy/system/artifacts
+
       - name: Build
         run: |
-          sudo chown -R nerves:nerves $GITHUB_WORKSPACE
-          mix deps.get
-          mix nerves.artifact --path deploy/system/artifacts
+          sudo -u nerves mix deps.get
+          sudo -u nerves mix nerves.artifact --path deploy/system/artifacts
 
       - name: Upload Artifacts and Create Release
         if: contains(github.ref, 'tags')
