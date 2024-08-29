@@ -16,34 +16,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
-      - name: Setup cache
-        id: cache-buildroot-downloads
-        uses: actions/cache@v3
-        with:
-          path: _build/dl
-          key: buildroot-${{ hashFiles('mix.lock') }}
+      # - name: Setup cache
+      #   id: cache-buildroot-downloads
+      #   uses: actions/cache@v3
+      #   with:
+      #     path: _build/dl
+      #     key: buildroot-${{ hashFiles('mix.lock') }}
 
       - name: Setup elixir
         run: |
+          chown -R nerves:nerves $GITHUB_WORKSPACE
           wget https://repo.hex.pm/builds/elixir/v$ELIXIR_VERSION.zip
           unzip -d /usr/local/elixir v$ELIXIR_VERSION.zip
-          echo "/usr/local/elixir/bin" >> $GITHUB_PATH
+          echo "export PATH=\"/usr/local/elixir/bin:$PATH\"" >> /home/nerves/.profile
 
       - name: Install nerves_bootstrap
         run: |
-          sudo -u nerves mix local.hex --force
-          sudo -u nerves mix local.rebar --force
-          sudo -u nerves mix archive.install hex nerves_bootstrap $NERVES_BOOTSTRAP_VERSION --force
+          cat /home/nerves/.bashrc
+          ls /usr/local/elixir/bin
+          sudo -i -u nerves echo \$PATH
+          sudo -i -u nerves echo \$SHELL
+          sudo -i -u nerves mix local.hex --force
+          sudo -i -u nerves mix local.rebar --force
+          sudo -i -u nerves mix archive.install hex nerves_bootstrap $NERVES_BOOTSTRAP_VERSION --force
 
       - name: Create artifact dir 
         run: |
-          sudo chown -R nerves:nerves $GITHUB_WORKSPACE
-          sudo -u nerves mkdir -p deploy/system/artifacts
+          sudo  -i -u nerves mkdir -p deploy/system/artifacts
 
       - name: Build
         run: |
-          sudo -u nerves mix deps.get
-          sudo -u nerves mix nerves.artifact --path deploy/system/artifacts
+          sudo -i -u nerves sh -c "cd $GITHUB_WORKSPACE; mix deps.get"
+          sudo -i -u nerves sh -c "cd $GITHUB_WORKSPACE; mix nerves.artifact --path $GITHUB_WORKSPACE/deploy/system/artifacts"
 
       - name: Upload Artifacts and Create Release
         if: contains(github.ref, 'tags')
