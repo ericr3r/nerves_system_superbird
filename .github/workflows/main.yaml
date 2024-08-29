@@ -1,4 +1,4 @@
-name: A workflow for building Buildroot artifacts
+name: Nerves System Build 
 on: push
 
 jobs:
