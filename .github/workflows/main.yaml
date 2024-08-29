@@ -16,12 +16,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v3
 
-      # - name: Setup cache
-      #   id: cache-buildroot-downloads
-      #   uses: actions/cache@v3
-      #   with:
-      #     path: _build/dl
-      #     key: buildroot-${{ hashFiles('mix.lock') }}
+      - name: Setup cache
+        id: cache-buildroot-downloads
+        uses: actions/cache@v3
+        with:
+          path: _build/dl
+          key: buildroot-${{ hashFiles('mix.lock') }}
 
       - name: Setup elixir
         run: |
