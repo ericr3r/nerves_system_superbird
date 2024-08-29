@@ -1,14 +1,14 @@
-# Spotify&trade; Car Thing
+# Spotify:tm: Car Thing
 
-[![CircleCI](https://circleci.com/gh/ericr3r/nerves_system_superbird.svg?style=svg)](https://circleci.com/gh/ericr3r/nerves_system_superbird)
+![CI Status](https://github.com/ericr3r/nerves_system_superbird/actions/workflows/main.yml/badge.svg)
 
-This is the base Nerves System configuration for the Spotify&trade; Car Thing.
+This is the base Nerves System configuration for the Spotify:tm: Car Thing.
 
 Networking is only done through [Gadget Mode](http://www.linux-usb.org/gadget/).
 
 ## Intial bootsrapping
 
-The initial steps to get a nerves release onto the Spotify&trade; Car Things are complicated.
+The initial steps to get a nerves release onto the Spotify:tm: Car Things are complicated.
 Please refer to the [bootstrap instructions](https://github.com/ericr3r/notes-superbird/bootsrapping.md)
 in the [ericr3r/notes-superbird](https://github.com/ericr3r/notes-superbird) repository.
 
@@ -35,7 +35,7 @@ systems](https://hexdocs.pm/nerves/customizing-systems.html).
 
 One of the goals of this system is to make it possible to do most development
 via one USB cable. That cable, when plugged into the USB OTG port, powers the
-Spotify&trade; Car Thing and provides local networking. Via the network connection, one
+Spotify:tm: Car Thing and provides local networking. Via the network connection, one
 can access an IEx prompt via ssh, transfer files via sftp, run firmware updates,
 use Erlang distribution and anything else that works over IP.
 
