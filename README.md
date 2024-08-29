@@ -1,6 +1,8 @@
 # Spotify:tm: Car Thing
 
-![CI Status](https://github.com/ericr3r/nerves_system_superbird/actions/workflows/main.yml/badge.svg)
+
+
+[![CI Status](https://github.com/ericr3r/nerves_system_superbird/actions/workflows/main.yaml/badge.svg)](https://github.com/ericr3r/nerves_system_superbird/actions/workflows/main.yaml)
 
 This is the base Nerves System configuration for the Spotify:tm: Car Thing.
 
