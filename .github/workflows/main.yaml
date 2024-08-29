@@ -1,0 +1,60 @@
+name: Nerves System Build 
+on: push
+
+jobs:
+  build:
+    name: Build system
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/nerves-project/nerves_system_br:1.28.2
+      options: --user root
+    env:
+      ELIXIR_VERSION: 1.17.2-otp-27
+      NERVES_BOOTSTRAP_VERSION: 1.13.0
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup cache
+        id: cache-buildroot-downloads
+        uses: actions/cache@v3
+        if: ${{ !github.event.act }} # skip during local actions testing
+        with:
+          path: _build/dl
+          key: buildroot-${{ hashFiles('mix.lock') }}
+
+      - name: Setup elixir
+        run: |
+          chown -R nerves:nerves $GITHUB_WORKSPACE
+          wget https://repo.hex.pm/builds/elixir/v$ELIXIR_VERSION.zip
+          unzip -d /usr/local/elixir v$ELIXIR_VERSION.zip
+          echo "export PATH=\"/usr/local/elixir/bin:$PATH\"" >> /home/nerves/.profile
+
+      - name: Install nerves_bootstrap
+        run: |
+          sudo -i -u nerves echo \$PATH
+          sudo -i -u nerves echo \$SHELL
+          sudo -i -u nerves mix local.hex --force
+          sudo -i -u nerves mix local.rebar --force
+          sudo -i -u nerves mix archive.install hex nerves_bootstrap $NERVES_BOOTSTRAP_VERSION --force
+
+      - name: Create artifact dir 
+        run: |
+          sudo  -i -u nerves mkdir -p /home/nerves/deploy/system/artifacts
+
+      - name: Build
+        run: |
+          sudo -i -u nerves sh -c "cd $GITHUB_WORKSPACE; mix deps.get"
+          sudo -i -u nerves sh -c "cd $GITHUB_WORKSPACE; mix nerves.artifact --path /home/nerves/deploy/system/artifacts"
+
+      - name: Upload Artifacts and Create Release
+        if: contains(github.ref, 'tags')
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: /home/nerves/deploy/system/artifacts/*
+          file_glob: true
+          tag: ${{ github.ref }}
+
+

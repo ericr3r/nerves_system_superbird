@@ -105,7 +105,6 @@ defmodule NervesSystemSuperbird.MixProject do
       "fwup_include",
       "rootfs_overlay",
       "CHANGELOG.md",
-      "cmdline.txt",
       "bootargs.txt",
       "fwup.conf",
       "LICENSE",

@@ -1,12 +1,28 @@
 # Spotify:tm: Car Thing
 
-[![CircleCI](https://circleci.com/gh/ericr3r/nerves_system_superbird.svg?style=svg)](https://circleci.com/gh/ericr3r/nerves_system_superbird)
+
+
+[![CI Status](https://github.com/ericr3r/nerves_system_superbird/actions/workflows/main.yaml/badge.svg)](https://github.com/ericr3r/nerves_system_superbird/actions/workflows/main.yaml)
 
 This is the base Nerves System configuration for the Spotify:tm: Car Thing.
 
 Networking is only done through [Gadget Mode](http://www.linux-usb.org/gadget/).
 
+## Intial bootsrapping
+
+The initial steps to get a nerves release onto the Spotify:tm: Car Things are complicated.
+Please refer to the [bootstrap instructions](https://github.com/ericr3r/notes-superbird/bootsrapping.md)
+in the [ericr3r/notes-superbird](https://github.com/ericr3r/notes-superbird) repository.
+
 ## Using
+
+Add `superbird` to `@all_targets` and
+```
+{:nerves_system_superbird, git: "git@github.com:ericr3r/nerves_system_superbird.git", 
+runtime: false, tag: ..., targets: :superbird}
+```
+to `deps` in `mix.exs`.
+ 
 
 The most common way of using this Nerves System is create a project with `mix
 nerves.new` and to export `MIX_TARGET=superbird`. See the [Getting started
