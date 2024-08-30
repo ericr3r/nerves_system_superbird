@@ -1,60 +1,53 @@
 name: Nerves System Build 
 on: push
 
+env:
+  OTP_VERSION: 27.0.1
+  ELIXIR_VERSION: 1.17.2-otp-27
+  NERVES_BOOTSTRAP_VERSION: 1.13.0
+
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-  build:
-    name: Build system
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/nerves-project/nerves_system_br:1.28.2
-      options: --user root
-    env:
-      ELIXIR_VERSION: 1.17.2-otp-27
-      NERVES_BOOTSTRAP_VERSION: 1.13.0
-    
+  get-br-dependencies:
+    runs-on: ubuntu-22.04
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Setup cache
-        id: cache-buildroot-downloads
-        uses: actions/cache@v3
-        if: ${{ !github.event.act }} # skip during local actions testing
+      - uses: actions/checkout@v4
+      - uses: gridpoint-com/actions-nerves-system@v1
+      - name: Get Buildroot Dependencies
+        uses: ./.actions/get-br-dependencies
         with:
-          path: _build/dl
-          key: buildroot-${{ hashFiles('mix.lock') }}
-
-      - name: Setup elixir
-        run: |
-          chown -R nerves:nerves $GITHUB_WORKSPACE
-          wget https://repo.hex.pm/builds/elixir/v$ELIXIR_VERSION.zip
-          unzip -d /usr/local/elixir v$ELIXIR_VERSION.zip
-          echo "export PATH=\"/usr/local/elixir/bin:$PATH\"" >> /home/nerves/.profile
-
-      - name: Install nerves_bootstrap
-        run: |
-          sudo -i -u nerves echo \$PATH
-          sudo -i -u nerves echo \$SHELL
-          sudo -i -u nerves mix local.hex --force
-          sudo -i -u nerves mix local.rebar --force
-          sudo -i -u nerves mix archive.install hex nerves_bootstrap $NERVES_BOOTSTRAP_VERSION --force
-
-      - name: Create artifact dir 
-        run: |
-          sudo  -i -u nerves mkdir -p /home/nerves/deploy/system/artifacts
-
-      - name: Build
-        run: |
-          sudo -i -u nerves sh -c "cd $GITHUB_WORKSPACE; mix deps.get"
-          sudo -i -u nerves sh -c "cd $GITHUB_WORKSPACE; mix nerves.artifact --path /home/nerves/deploy/system/artifacts"
-
-      - name: Upload Artifacts and Create Release
-        if: contains(github.ref, 'tags')
-        uses: svenstaro/upload-release-action@v2
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          nerves-bootstrap-version: ${{ env.NERVES_BOOTSTRAP_VERSION }}
+          push-to-download-site: false
+  build-system:
+    needs: [get-br-dependencies]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gridpoint-com/actions-nerves-system@v1
+      - name: Build nerves_system
+        uses: ./.actions/build-system
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: /home/nerves/deploy/system/artifacts/*
-          file_glob: true
-          tag: ${{ github.ref }}
+          otp-version: ${{ env.OTP_VERSION }}
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          nerves-bootstrap-version: ${{ env.NERVES_BOOTSTRAP_VERSION }}
+  deploy-system:
+    needs: [build-system]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: gridpoint-com/actions-nerves-system@v1
+      - name: Deploy nerves_system
+        uses: ./.actions/deploy-system
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
 
 
