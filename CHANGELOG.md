@@ -12,6 +12,7 @@ follows:
    releases, and Linux kernel updates. They're also made to fix bugs and add
    features to the build infrastructure.
 
+
 ## v1.28.0
 
 First Version of Spotify:tm: Car Thing support initially based on v1.28.0 on [nerves_system_rpi0_2](https://github.com/fhunleth/nerves_system_rpi0_2).
