@@ -47,7 +47,7 @@ jobs:
       - name: Deploy nerves_system
         uses: ./.actions/deploy-system
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ secrets.ARTIFACT_GITHUB_TOKEN }}
 
 
 
