@@ -13,7 +13,7 @@ follows:
    features to the build infrastructure.
 
 
-## v1.28.0
+## v1.28.0-test1
 
 First Version of Spotify:tm: Car Thing support initially based on v1.28.0 on [nerves_system_rpi0_2](https://github.com/fhunleth/nerves_system_rpi0_2).
 
