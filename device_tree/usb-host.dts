@@ -1,0 +1,28 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    fragment@0 {
+        target-path = "/soc/usb@ffe09000";
+        __overlay__ {
+            dr_mode = "host";
+            status = "okay";
+        };
+    };
+
+    fragment@1 {
+        target-path = "/soc/usb@ffe09000/usb@ff400000";
+        __overlay__ {
+            status = "disabled";
+        };
+    };
+
+    fragment@2 {
+        target-path = "/soc/usb@ffe09000/usb@ff500000";
+        __overlay__ {
+            status = "okay";
+        };
+    };
+};
+
+
