@@ -12,6 +12,10 @@ follows:
    releases, and Linux kernel updates. They're also made to fix bugs and add
    features to the build infrastructure.
 
+## v1.28.2
+
+Support Nerves Web Kiosk with Wayland and Cog components.
+
 ## v1.28.1
 
 This is a security/bug fix update.
