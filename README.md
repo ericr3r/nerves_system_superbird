@@ -10,14 +10,14 @@ Networking is only done through [Gadget Mode](http://www.linux-usb.org/gadget/).
 ## Intial bootsrapping
 
 The initial steps to get a nerves release onto the Spotify&trade; Car Things are complicated.
-Please refer to the [bootstrap instructions](https://github.com/ericr3r/notes-superbird/bootsrapping.md) in the [ericr3r/notes-superbird](https://github.com/ericr3r/notes-superbird) repository.
+Please refer to the [bootstrap instructions](https://github.com/ericr3r/notes-superbird/blob/main/bootstrapping.md) in the [ericr3r/notes-superbird](https://github.com/ericr3r/notes-superbird) repository.
 
 ## Using
 
 Add `superbird` to `@all_targets` and
 ```
-{:nerves_system_superbird, git: "git@github.com:ericr3r/nerves_system_superbird.git", 
-runtime: false, tag: ..., targets: :superbird}
+{:nerves_system_superbird, github: "ericr3r/nerves_system_superbird",
+       tag: .., runtime: false, targets: :superbird},
 ```
 to `deps` in `mix.exs`.
  
