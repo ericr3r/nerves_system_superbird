@@ -4,11 +4,11 @@ on: push
 env:
   OTP_VERSION: 27.0.1
   ELIXIR_VERSION: 1.17.2-otp-27
-  NERVES_BOOTSTRAP_VERSION: 1.13.0
+  NERVES_BOOTSTRAP_VERSION: 1.13.1
 
 permissions:
-  id-token: write
   contents: read
+  id-token: write
 
 jobs:
   get-br-dependencies:
