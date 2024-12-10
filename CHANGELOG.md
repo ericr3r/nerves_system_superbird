@@ -12,6 +12,13 @@ follows:
    releases, and Linux kernel updates. They're also made to fix bugs and add
    features to the build infrastructure.
 
+## v1.29.1
+
+This is a bug fix update.
+
+* Changes
+  * Fix missing SSL/TLS support
+
 ## v1.29.0
 
 This is a major Erlang and Buildroot update.
