@@ -95,8 +95,12 @@ defmodule NervesSystemSuperbird.MixProject do
   defp package do
     [
       files: package_files(),
-      licenses: ["Apache-2.0"],
-      links: %{"GitHub" => @source_url}
+      licenses: ["GPL-2.0-only", "GPL-2.0-or-later"],
+      links: %{
+        "GitHub" => @source_url,
+        "REUSE Compliance" =>
+          "https://api.reuse.software/info/github.com/ericr3r/nerves_system_superbird"
+      }
     ]
   end
 
@@ -107,13 +111,14 @@ defmodule NervesSystemSuperbird.MixProject do
       "CHANGELOG.md",
       "bootargs.txt",
       "fwup.conf",
-      "LICENSE",
+      "LICENSES/*",
       "linux-6.6.defconfig",
       "mix.exs",
       "nerves_defconfig",
       "post-build.sh",
       "post-createfs.sh",
       "README.md",
+      "REUSE.toml",
       "VERSION"
     ]
   end

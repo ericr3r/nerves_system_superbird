@@ -2,6 +2,8 @@
 
 
 [![CI Status](https://github.com/ericr3r/nerves_system_superbird/actions/workflows/main.yaml/badge.svg)](https://github.com/ericr3r/nerves_system_superbird/actions/workflows/main.yaml)
+[![REUSE status](https://api.reuse.software/badge/github.com/ericr3r/nerves_system_superbird)](https://api.reuse.software/info/github.com/ericr3r/nerves_system_superbird)
+
 
 This is the base Nerves System configuration for the Spotify&trade; Car Thing.
 
