@@ -70,7 +70,7 @@ path = [
  "config.txt",
  "rootfs_overlay/etc/boardid.config",
  "rootfs_overlay/etc/erlinit.config",
- "rootfs_overlay/etc/fw_env.config"
+ "rootfs_overlay/etc/fw_env.config",
  "rootfs_overlay/etc/xdg/weston/weston.ini"
 ]
 precedence = "aggregate"
