@@ -27,12 +27,13 @@ SPDX-License-Identifier = "CC-BY-4.0"
 # Buildroot derived or related files
 [[annotations]]
 path = [
+ "bootargs.txt"
  "Config.in",
  "package/**",
  "external.mk",
  "nerves_defconfig",
  "post-build.sh",
- "post-createfs.sh"
+ "post-createfs.sh",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "The Buildroot developers <buildroot@buildroot.org>"
@@ -41,6 +42,7 @@ SPDX-License-Identifier = "GPL-2.0-or-later"
 # Linux kernel derived or related files
 [[annotations]]
 path = [
+ "device_tree/*.dts",
  "linux/*",
  "linux-6.6.defconfig",
  "ramoops.dts"
@@ -69,6 +71,7 @@ path = [
  "rootfs_overlay/etc/boardid.config",
  "rootfs_overlay/etc/erlinit.config",
  "rootfs_overlay/etc/fw_env.config"
+ "rootfs_overlay/etc/xdg/weston/weston.ini"
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "None"
