@@ -3,7 +3,7 @@ version = 1
 [[annotations]]
 path = [
  ".formatter.exs",
- ".github/workflows/ci.yml",
+ ".github/workflows/main.yaml",
  ".gitignore",
  "CHANGELOG.md",
  "NOTICE",
@@ -27,7 +27,7 @@ SPDX-License-Identifier = "CC-BY-4.0"
 # Buildroot derived or related files
 [[annotations]]
 path = [
- "bootargs.txt"
+ "bootargs.txt",
  "Config.in",
  "package/**",
  "external.mk",
