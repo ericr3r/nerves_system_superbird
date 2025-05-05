@@ -1,8 +1,8 @@
-name: Nerves System Build 
+name: Nerves System Build
 on: push
 
 env:
-  OTP_VERSION: 27.3
+  OTP_VERSION: 27.3.3
   ELIXIR_VERSION: 1.18.3-otp-27
   NERVES_BOOTSTRAP_VERSION: 1.13.1
 
@@ -48,6 +48,3 @@ jobs:
         uses: ./.actions/deploy-system
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-
-
-
