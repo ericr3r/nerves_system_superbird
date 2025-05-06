@@ -12,6 +12,14 @@ follows:
    releases, and Linux kernel updates. They're also made to fix bugs and add
    features to the build infrastructure.
 
+## v1.30.1
+
+This is a security/bug fix update.
+
+* Updated dependencies
+  * [Erlang/OTP 27.3.3](https://erlang.org/download/OTP-27.3.3.README)
+  * [nerves_system_br v1.30.1](https://github.com/nerves-project/nerves_system_br/releases/tag/v1.30.1)
+
 ## v1.30.0
 
 This is a major Buildroot update.
@@ -64,7 +72,7 @@ Support Nerves Web Kiosk with Wayland and Cog components.
 This is a security/bug fix update.
 
 * Changes
-  * Create overlays for USB host and gadget mode support  
+  * Create overlays for USB host and gadget mode support
 
 * Updated dependencies
   * [nerves_system_br v1.28.3](https://github.com/nerves-project/nerves_system_br/releases/tag/v1.28.3)
@@ -79,9 +87,8 @@ Please see the [nerves_system_br v1.28.0 release notes](https://github.com/nerve
 for upgrade instructions if you've forked this system.
 
 * Versions
-  * [Elixir 1.17](https://elixir-lang.org/docs.html) 
+  * [Elixir 1.17](https://elixir-lang.org/docs.html)
   * [Linux 6.6](https://github.com/alexcaoys/linux-superbird-6.6.y)
   * [nerves_system_br v1.28.1](https://github.com/nerves-project/nerves_system_br/releases/tag/v1.28.1)
   * [Buildroot 2024.05](https://lore.kernel.org/buildroot/87bk46tjk2.fsf@dell.be.48ers.dk/T/)
   * [Erlang/OTP 27.0](https://erlang.org/download/OTP-27.0.README)
-
