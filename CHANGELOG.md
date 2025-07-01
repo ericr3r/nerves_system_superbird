@@ -12,6 +12,13 @@ follows:
    releases, and Linux kernel updates. They're also made to fix bugs and add
    features to the build infrastructure.
 
+## v1.31.1
+
+This is a bug fix update.
+
+* Changes
+  * Fixed USB Gadget support for macOS
+
 ## v1.31.0
 
 This is a major Buildroot update.
