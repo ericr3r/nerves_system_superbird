@@ -12,6 +12,26 @@ follows:
    releases, and Linux kernel updates. They're also made to fix bugs and add
    features to the build infrastructure.
 
+## v1.33.0
+
+This is a major Buildroot and Erlang/OTP update. It updates the build
+infrastructure to the `nerves_system_rpi4` v1.33.0 baseline (the last release
+before the v2.0.0 MicroSD/eMMC rollback layout change), so the existing fwup
+and U-Boot environment layout is preserved.
+
+The Linux kernel is unchanged in this release (still Linux 6.6); kernel updates
+are tracked separately.
+
+* Changes
+  * Host Erlang/Elixir versions are now pinned with `mise` (`mise.toml`)
+  * Use `def cli` instead of the deprecated `preferred_cli_env`
+
+* Updated dependencies
+  * [nerves_system_br 1.33.0](https://github.com/nerves-project/nerves_system_br/releases/tag/v1.33.0)
+    * [Buildroot 2025.11](https://lore.kernel.org/buildroot/87bjk439tj.fsf@dell.be.48ers.dk/T/)
+    * [Erlang/OTP 28.3](https://erlang.org/download/OTP-28.3.README.md)
+    * [fwup 1.15.0](https://github.com/fwup-home/fwup/releases/tag/v1.15.0)
+
 ## v1.31.1
 
 This is a bug fix update.

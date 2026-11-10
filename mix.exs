@@ -12,7 +12,7 @@ defmodule NervesSystemSuperbird.MixProject do
     [
       app: @app,
       version: @version,
-      # Because we're using OTP 27, we need to enforce Elixir 1.17 or later.
+      # Because we're using OTP 28, we need to enforce Elixir 1.17 or later.
       elixir: "~> 1.17",
       compilers: Mix.compilers() ++ [:nerves_package],
       nerves_package: nerves_package(),
@@ -20,13 +20,12 @@ defmodule NervesSystemSuperbird.MixProject do
       package: package(),
       deps: deps(),
       aliases: [loadconfig: [&bootstrap/1]],
-      docs: docs(),
-      preferred_cli_env: %{
-        docs: :docs,
-        "hex.build": :docs,
-        "hex.publish": :docs
-      }
+      docs: docs()
     ]
+  end
+
+  def cli do
+    [preferred_envs: %{docs: :docs, "hex.build": :docs, "hex.publish": :docs}]
   end
 
   def application do
@@ -43,7 +42,7 @@ defmodule NervesSystemSuperbird.MixProject do
     [
       type: :system,
       artifact_sites: [
-        {:github_releases, "#{@github_organization}/#{@app}"}
+        # {:github_releases, "#{@github_organization}/#{@app}"}
       ],
       build_runner_opts: build_runner_opts(),
       platform: Nerves.System.BR,
@@ -67,9 +66,9 @@ defmodule NervesSystemSuperbird.MixProject do
 
   defp deps do
     [
-      {:nerves, "~> 1.11.1", runtime: false},
-      {:nerves_system_br, "~> 1.30.1", runtime: false},
-      {:nerves_toolchain_aarch64_nerves_linux_gnu, "~> 14.2.0", runtime: false},
+      {:nerves, "~> 1.11", runtime: false},
+      {:nerves_system_br, "1.33.0", runtime: false},
+      {:nerves_toolchain_aarch64_nerves_linux_gnu, "~> 13.2.0", runtime: false},
       {:nerves_system_linter, "~> 0.4", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.22", only: :docs, runtime: false}
     ]
