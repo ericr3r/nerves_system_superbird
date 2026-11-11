@@ -12,6 +12,10 @@ follows:
    releases, and Linux kernel updates. They're also made to fix bugs and add
    features to the build infrastructure.
 
+## v1.33.1
+
+Fix download target
+
 ## v1.33.0
 
 This is a major Buildroot and Erlang/OTP update. It updates the build
