@@ -118,6 +118,7 @@ defmodule NervesSystemSuperbird.MixProject do
     [
       "CHANGELOG.md",
       "LICENSES/*",
+      "checksum.exs",
       "README.md",
       "REUSE.toml",
       "VERSION"
