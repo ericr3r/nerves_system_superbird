@@ -44,6 +44,7 @@ defmodule NervesSystemSuperbird.MixProject do
       artifact_sites: [
         {:github_releases, "#{@github_organization}/#{@app}"}
       ],
+      artifact_checksum: true,
       build_runner_opts: build_runner_opts(),
       platform: Nerves.System.BR,
       platform_config: [
@@ -60,15 +61,15 @@ defmodule NervesSystemSuperbird.MixProject do
         {"TARGET_GCC_FLAGS",
          "-mabi=lp64 -fstack-protector-strong -mcpu=cortex-a53 -fPIE -pie -Wl,-z,now -Wl,-z,relro"}
       ],
-      checksum: package_files()
+      checksum: source_finger_print_files()
     ]
   end
 
   defp deps do
     [
-      {:nerves, "~> 1.11", runtime: false},
-      {:nerves_system_br, "1.33.0", runtime: false},
-      {:nerves_toolchain_aarch64_nerves_linux_gnu, "~> 13.2.0", runtime: false},
+      {:nerves, "~> 1.11 or ~> 2.0 or ~> 2.0.0-dev", runtime: false},
+      {:nerves_system_br, "1.35.3", runtime: false},
+      {:nerves_toolchain_armv7_nerves_linux_gnueabihf, "~> 15.3.0", runtime: false},
       {:nerves_system_linter, "~> 0.4", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.22", only: :docs, runtime: false}
     ]
@@ -103,23 +104,29 @@ defmodule NervesSystemSuperbird.MixProject do
     ]
   end
 
-  defp package_files do
+  defp source_finger_print_files do
     [
       "fwup_include",
       "rootfs_overlay",
-      "CHANGELOG.md",
       "bootargs.txt",
       "fwup.conf",
-      "LICENSES/*",
       "linux-6.6.defconfig",
       "mix.exs",
       "nerves_defconfig",
       "post-build.sh",
-      "post-createfs.sh",
+      "post-createfs.sh"
+    ]
+  end
+
+  defp package_files do
+    [
+      "CHANGELOG.md",
+      "checksum.exs",
+      "LICENSES/*",
       "README.md",
       "REUSE.toml",
       "VERSION"
-    ]
+    ] ++ source_finger_print_files()
   end
 
   defp build_runner_opts() do
