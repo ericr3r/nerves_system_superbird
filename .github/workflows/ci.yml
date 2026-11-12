@@ -14,7 +14,7 @@ jobs:
   get-br-dependencies:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: fhunleth/actions-nerves2-package@v0
       - name: Get Buildroot Dependencies
         uses: ./.actions/get-br-dependencies
@@ -43,7 +43,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: fhunleth/actions-nerves2-package@v0
       - name: Deploy nerves_system
         uses: ./.actions/deploy-package
