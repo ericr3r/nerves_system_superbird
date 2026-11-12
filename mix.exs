@@ -102,6 +102,7 @@ defmodule NervesSystemSuperbird.MixProject do
 
   defp source_finger_print_files do
     [
+      "config/config.exs",
       "fwup_include",
       "rootfs_overlay",
       "bootargs.txt",
