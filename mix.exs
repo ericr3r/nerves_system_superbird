@@ -121,7 +121,6 @@ defmodule NervesSystemSuperbird.MixProject do
   defp package_files do
     [
       "CHANGELOG.md",
-      "checksum.exs",
       "LICENSES/*",
       "README.md",
       "REUSE.toml",
