@@ -2,9 +2,9 @@ name: Nerves System Build
 on: push
 
 env:
-  OTP_VERSION: 28.3
-  ELIXIR_VERSION: 1.19.4-otp-28
-  NERVES_BOOTSTRAP_VERSION: 1.14.0
+  OTP_VERSION: 29.1.2
+  ELIXIR_VERSION: 1.20.5-otp-29
+  NERVES_BOOTSTRAP_VERSION: 1.17.4
 
 permissions:
   contents: read
@@ -23,20 +23,21 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           nerves-bootstrap-version: ${{ env.NERVES_BOOTSTRAP_VERSION }}
           push-to-download-site: false
-  build-system:
+  build-package:
     needs: [get-br-dependencies]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: fhunleth/actions-nerves2-package@v0
-      - name: Build nerves_system
-        uses: ./.actions/build-system
+      - name: Build nerves package
+        uses: ./.actions/build-package
         with:
+          enable-ccache: true
           otp-version: ${{ env.OTP_VERSION }}
           elixir-version: ${{ env.ELIXIR_VERSION }}
           nerves-bootstrap-version: ${{ env.NERVES_BOOTSTRAP_VERSION }}
-  deploy-system:
-    needs: [build-system]
+  deploy-package:
+    needs: [build-package]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
@@ -45,6 +46,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: fhunleth/actions-nerves2-package@v0
       - name: Deploy nerves_system
-        uses: ./.actions/deploy-system
+        uses: ./.actions/deploy-package
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
