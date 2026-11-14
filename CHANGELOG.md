@@ -12,6 +12,19 @@ follows:
    releases, and Linux kernel updates. They're also made to fix bugs and add
    features to the build infrastructure.
 
+## v1.40.0
+
+This is a major Buildroot update with security and feature updates throughout.
+
+It does not appear that custom systems require modification for this upgrade, but your system might use something not tested by the officially supported ones.
+
+    Package updates
+        nerves_system_br 1.35.3
+        Buildroot 2026.08.1
+        Erlang/OTP 29.1.2
+
+Build has been updated to use Nerves 2 (prerelease) but should still work with Nerves 1.
+
 ## v1.33.1
 
 Fix download target
