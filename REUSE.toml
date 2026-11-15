@@ -46,7 +46,7 @@ SPDX-License-Identifier = "GPL-2.0-or-later"
 path = [
  "device_tree/usb-host.dts",
  "device_tree/watchdog.dts",
- "kernel/*",
+ "linux-7.0/*",
  "linux/*",
  "ramoops.dts"
 ]
