@@ -44,23 +44,14 @@ SPDX-License-Identifier = "GPL-2.0-or-later"
 # Linux kernel derived or related files
 [[annotations]]
 path = [
- "device_tree/usb-host.dts",
- "device_tree/watchdog.dts",
- "linux-7.0/*",
+ "device_tree/*.dts",
+ "kernel/*",
  "linux/*",
  "ramoops.dts"
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "Various"
-SPDX-License-Identifier = "GPL-2.0-or-later"
-
-# Superbird board device tree - carries its own SPDX header upstream
-[[annotations]]
-path = [
- "device_tree/meson-g12a-superbird.dts"
-]
-precedence = "aggregate"
-SPDX-FileCopyrightText = "Various"
+SPDX-License-Identifier = "GPL-2.0-only"
 SPDX-License-Identifier = "GPL-2.0-only"
 
 # Fwup config files

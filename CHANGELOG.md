@@ -30,6 +30,13 @@ The old `linux-6.6.defconfig` and the 6.6-era squashfs readahead backport patch
 have been removed. The device tree overlay flow (watchdog/usb-host merged with
 `fdtoverlay` in `post-build.sh`) is unchanged.
 
+**Breaking: eMMC device path changed `/dev/mmcblk2` -> `/dev/mmcblk0`.** The
+mainline board device tree enables only the eMMC controller (`&sd_emmc_c`), so
+it now enumerates as `mmcblk0` instead of `mmcblk2`. `bootargs.txt`,
+`fwup_include/fwup-common.conf`, `rootfs_overlay/etc/erlinit.config`, and
+`rootfs_overlay/etc/fw_env.config` were all updated accordingly. Verify on first
+boot (`cat /proc/partitions`, `dmesg | grep mmc`).
+
 See `docs/kernel-7.0-upgrade.md` for details and the yocto-sync procedure.
 
 ## v1.40.0
