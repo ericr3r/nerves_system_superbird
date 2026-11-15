@@ -1,0 +1,273 @@
+From 6804071bd43fe3b247e27fc4fa0f0f3a21ec3dba Mon Sep 17 00:00:00 2001
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 22:45:00 -0400
+Subject: [PATCH] media: meson: vdec: support single-planar NV12 on the CAPTURE
+ queue
+
+meson-vdec only offers the multi-planar V4L2_PIX_FMT_NV12M for decoded
+frames. Clients that render decoded buffers directly as a single dmabuf
+cannot consume that, and have to insert a format conversion instead.
+Chromium is one: with only NV12M on offer it finds no directly renderable
+CAPTURE format, falls back to constructing an ImageProcessor, and where
+none is available the decoder stalls having produced no frames at all.
+
+Nothing about the hardware requires two allocations. The decoder reaches
+its output through canvas descriptors, one for luma and one for chroma,
+each taking an arbitrary physical address. Placing chroma inside the same
+buffer immediately after luma is only a matter of which address the
+chroma canvas is programmed with.
+
+The address that has to be is not a free choice. A single-buffer NV12
+consumer derives the chroma offset from bytesperline * height, so chroma
+must sit exactly one padded luma plane past the start of the buffer, and
+the CAPTURE queue must report that padded height. The luma canvas is
+programmed at ALIGN(width, 32) x ALIGN(height, 32), so that is the
+geometry both the offset and VIDIOC_G_FMT now use. The visible rectangle
+is no longer implied by the format and is read from VIDIOC_G_SELECTION,
+which the CAPTURE queue now implements.
+
+That split means the stream geometry can only come from the OUTPUT queue.
+vdec_s_fmt also derived sess->width and sess->height from the CAPTURE
+result, which was harmless while no CAPTURE format padded anything, but
+would now feed the padded height back in as if it were visible. A CAPTURE
+S_FMT cannot redefine the size of the stream being decoded, so drop it;
+the OUTPUT path already assigns the same values it used to produce.
+
+Only H.264 gains the format here. MPEG1/MPEG2 reach their output through
+the same canvas helper and could follow trivially, but are untested. VP9
+cannot: it programs the SAO output registers itself and reads plane 1
+directly, so it needs its own change.
+
+Tested on a Spotify Car Thing (Amlogic G12A) decoding H.264 through
+chromium's V4L2 stateful decoder.
+
+Upstream-Status: Pending
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+---
+ drivers/staging/media/meson/vdec/vdec.c       | 40 +++++++++++++++++--
+ drivers/staging/media/meson/vdec/vdec.h       |  1 +
+ .../staging/media/meson/vdec/vdec_helpers.c   | 26 ++++++++----
+ .../staging/media/meson/vdec/vdec_platform.c  | 12 +++---
+ 4 files changed, 61 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 7f1a3c2..6b87ea0 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -43,6 +43,13 @@ u32 amvdec_get_output_size(struct amvdec_session *sess)
+ }
+ EXPORT_SYMBOL_GPL(amvdec_get_output_size);
+ 
++/* padded luma plane, which is also where chroma starts in a single-buffer NV12 */
++u32 amvdec_get_luma_size(struct amvdec_session *sess)
++{
++	return ALIGN(sess->width, 32) * ALIGN(sess->height, 32);
++}
++EXPORT_SYMBOL_GPL(amvdec_get_luma_size);
++
+ static int vdec_codec_needs_recycle(struct amvdec_session *sess)
+ {
+ 	struct amvdec_codec_ops *codec_ops = sess->fmt_out->codec_ops;
+@@ -193,6 +200,7 @@ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+ {
+ 	struct amvdec_session *sess = vb2_get_drv_priv(q);
+ 	u32 output_size = amvdec_get_output_size(sess);
++	u32 luma_size = amvdec_get_luma_size(sess);
+ 
+ 	if (*num_planes) {
+ 		switch (q->type) {
+@@ -203,6 +211,11 @@ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+ 			break;
+ 		case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+ 			switch (sess->pixfmt_cap) {
++			case V4L2_PIX_FMT_NV12:
++				if (*num_planes != 1 ||
++				    sizes[0] < luma_size * 3 / 2)
++					return -EINVAL;
++				break;
+ 			case V4L2_PIX_FMT_NV12M:
+ 				if (*num_planes != 2 ||
+ 				    sizes[0] < output_size ||
+@@ -234,6 +247,10 @@ static int vdec_queue_setup(struct vb2_queue *q, unsigned int *num_buffers,
+ 		break;
+ 	case V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE:
+ 		switch (sess->pixfmt_cap) {
++		case V4L2_PIX_FMT_NV12:
++			sizes[0] = luma_size * 3 / 2;
++			*num_planes = 1;
++			break;
+ 		case V4L2_PIX_FMT_NV12M:
+ 			sizes[0] = output_size;
+ 			sizes[1] = output_size / 2;
+@@ -530,7 +547,20 @@ vdec_try_fmt_common(struct amvdec_session *sess, u32 size,
+ 			pixmp->pixelformat = fmt_out->pixfmts_cap[0];
+ 
+ 		memset(pfmt[1].reserved, 0, sizeof(pfmt[1].reserved));
+-		if (pixmp->pixelformat == V4L2_PIX_FMT_NV12M) {
++		if (pixmp->pixelformat == V4L2_PIX_FMT_NV12) {
++			/*
++			 * A single-buffer NV12 consumer derives the chroma
++			 * offset from bytesperline * height, so the height
++			 * reported here has to be the padded one the canvas
++			 * is programmed with. VIDIOC_G_SELECTION carries the
++			 * visible rectangle.
++			 */
++			pixmp->height = ALIGN(pixmp->height, 32);
++			pfmt[0].bytesperline = ALIGN(pixmp->width, 32);
++			pfmt[0].sizeimage =
++				pfmt[0].bytesperline * pixmp->height * 3 / 2;
++			pixmp->num_planes = 1;
++		} else if (pixmp->pixelformat == V4L2_PIX_FMT_NV12M) {
+ 			pfmt[0].sizeimage = output_size;
+ 			pfmt[0].bytesperline = ALIGN(pixmp->width, 32);
+ 
+@@ -640,11 +670,13 @@ static int vdec_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
+ 	format.fmt.pix_mp.pixelformat = pixfmt_cap;
+ 	format.fmt.pix_mp.width = orig_pixmp.width;
+ 	format.fmt.pix_mp.height = orig_pixmp.height;
++	/*
++	 * Only the OUTPUT queue defines the stream geometry, and it is set
++	 * above. Deriving it from the CAPTURE result as well would feed the
++	 * padded single-buffer NV12 height back in as if it were visible.
++	 */
+ 	vdec_try_fmt_common(sess, num_formats, &format);
+ 
+-	sess->width = format.fmt.pix_mp.width;
+-	sess->height = format.fmt.pix_mp.height;
+-
+ 	if (f->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+ 		sess->fmt_out = fmt_out;
+ 	else if (f->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+diff --git a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+index 7a5d8e8..f1aec1f 100644
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -288,5 +288,6 @@ static inline struct amvdec_session *file_to_amvdec_session(struct file *filp)
+ }
+ 
+ u32 amvdec_get_output_size(struct amvdec_session *sess);
++u32 amvdec_get_luma_size(struct amvdec_session *sess);
+ 
+ #endif
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index f02c21d..90f53fb 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -138,9 +138,9 @@ static int set_canvas_yuv420m(struct amvdec_session *sess,
+ 	return 0;
+ }
+ 
+-static int set_canvas_nv12m(struct amvdec_session *sess,
+-			    struct vb2_buffer *vb, u32 width,
+-			    u32 height, u32 reg)
++static int set_canvas_nv12(struct amvdec_session *sess,
++			   struct vb2_buffer *vb, u32 width,
++			   u32 height, u32 reg, bool multiplanar)
+ {
+ 	struct amvdec_core *core = sess->core;
+ 	u8 canvas_id[NUM_CANVAS_NV12]; /* Y U/V */
+@@ -151,11 +151,15 @@ static int set_canvas_nv12m(struct amvdec_session *sess,
+ 		ret = canvas_alloc(sess, &canvas_id[i]);
+ 		if (ret)
+ 			return ret;
+-
+-		buf_paddr[i] =
+-		    vb2_dma_contig_plane_dma_addr(vb, i);
+ 	}
+ 
++	buf_paddr[0] = vb2_dma_contig_plane_dma_addr(vb, 0);
++	/* one buffer keeps chroma past the padded luma the Y canvas covers */
++	if (multiplanar)
++		buf_paddr[1] = vb2_dma_contig_plane_dma_addr(vb, 1);
++	else
++		buf_paddr[1] = buf_paddr[0] + width * height;
++
+ 	/* Y plane */
+ 	meson_canvas_config(core->canvas, canvas_id[0], buf_paddr[0],
+ 			    width, height, MESON_CANVAS_WRAP_NONE,
+@@ -196,9 +200,11 @@ int amvdec_set_canvases(struct amvdec_session *sess,
+ 		reg_cur = reg_base[reg_base_cur] + reg_num_cur * 4;
+ 
+ 		switch (pixfmt) {
++		case V4L2_PIX_FMT_NV12:
+ 		case V4L2_PIX_FMT_NV12M:
+-			ret = set_canvas_nv12m(sess, &buf->vb.vb2_buf, width,
+-					       height, reg_cur);
++			ret = set_canvas_nv12(sess, &buf->vb.vb2_buf, width,
++					      height, reg_cur,
++					      pixfmt == V4L2_PIX_FMT_NV12M);
+ 			if (ret)
+ 				return ret;
+ 			break;
+@@ -279,6 +285,10 @@ static void dst_buf_done(struct amvdec_session *sess,
+ 	u32 output_size = amvdec_get_output_size(sess);
+ 
+ 	switch (sess->pixfmt_cap) {
++	case V4L2_PIX_FMT_NV12:
++		vb2_set_plane_payload(&vbuf->vb2_buf, 0,
++				      amvdec_get_luma_size(sess) * 3 / 2);
++		break;
+ 	case V4L2_PIX_FMT_NV12M:
+ 		vb2_set_plane_payload(&vbuf->vb2_buf, 0, output_size);
+ 		vb2_set_plane_payload(&vbuf->vb2_buf, 1, output_size / 2);
+diff --git a/drivers/staging/media/meson/vdec/vdec_platform.c b/drivers/staging/media/meson/vdec/vdec_platform.c
+index 66bb307..958dea2 100644
+--- a/drivers/staging/media/meson/vdec/vdec_platform.c
++++ b/drivers/staging/media/meson/vdec/vdec_platform.c
+@@ -23,7 +23,7 @@ static const struct amvdec_format vdec_formats_gxbb[] = {
+ 		.vdec_ops = &vdec_1_ops,
+ 		.codec_ops = &codec_h264_ops,
+ 		.firmware_path = "meson/vdec/gxbb_h264.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+@@ -73,7 +73,7 @@ static const struct amvdec_format vdec_formats_gxl[] = {
+ 		.vdec_ops = &vdec_1_ops,
+ 		.codec_ops = &codec_h264_ops,
+ 		.firmware_path = "meson/vdec/gxl_h264.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+@@ -111,7 +111,7 @@ static const struct amvdec_format vdec_formats_gxlx[] = {
+ 		.vdec_ops = &vdec_1_ops,
+ 		.codec_ops = &codec_h264_ops,
+ 		.firmware_path = "meson/vdec/gxl_h264.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+@@ -161,7 +161,7 @@ static const struct amvdec_format vdec_formats_gxm[] = {
+ 		.vdec_ops = &vdec_1_ops,
+ 		.codec_ops = &codec_h264_ops,
+ 		.firmware_path = "meson/vdec/gxm_h264.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+@@ -211,7 +211,7 @@ static const struct amvdec_format vdec_formats_g12a[] = {
+ 		.vdec_ops = &vdec_1_ops,
+ 		.codec_ops = &codec_h264_ops,
+ 		.firmware_path = "meson/vdec/g12a_h264.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+@@ -261,7 +261,7 @@ static const struct amvdec_format vdec_formats_sm1[] = {
+ 		.vdec_ops = &vdec_1_ops,
+ 		.codec_ops = &codec_h264_ops,
+ 		.firmware_path = "meson/vdec/g12a_h264.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+-- 
+2.53.0
+

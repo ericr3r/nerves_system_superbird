@@ -12,6 +12,26 @@ follows:
    releases, and Linux kernel updates. They're also made to fix bugs and add
    features to the build infrastructure.
 
+## v1.41.0
+
+Major kernel update: move from the downstream `linux-superbird-6.6.y` tree
+(6.6.43) to **mainline stable Linux 7.0.2** with the superbird patch set and
+kconfig fragments shared with `yocto-superbird`
+(`meta-superbird/recipes-kernel/linux`).
+
+    Kernel
+        Linux 7.0.2 (kernel.org tarball; matches the yocto recipe's SRCREV == v7.0.2)
+        25 superbird patches imported verbatim from the yocto recipe (linux/0001..0025)
+        Base device tree added via a generated file-add patch (linux/0026); see tools/gen-dts-patch.sh
+        Config is now the in-tree arm64 defconfig + superbird.cfg / superbird-disable.cfg / superbird-usb-host.cfg fragments (kernel/)
+        Kernel modules are now enabled; usb-host class drivers ship as .ko on the rootfs
+
+The old `linux-6.6.defconfig` and the 6.6-era squashfs readahead backport patch
+have been removed. The device tree overlay flow (watchdog/usb-host merged with
+`fdtoverlay` in `post-build.sh`) is unchanged.
+
+See `docs/kernel-7.0-upgrade.md` for details and the yocto-sync procedure.
+
 ## v1.40.0
 
 This is a major Buildroot update with security and feature updates throughout.

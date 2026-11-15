@@ -1,0 +1,51 @@
+From b8e97f1ff6f7ddc6fef77160e867ecea043c8bcb Mon Sep 17 00:00:00 2001
+From: Neel Patel <108803410+68p@users.noreply.github.com>
+Date: Sat, 18 Jul 2026 21:00:00 +0000
+Subject: [PATCH] drm/meson: disable AFBC scanout on Spotify Superbird
+
+The G12A AFBCD primary-plane path corrupts individual tiles on the
+Spotify Car Thing while the framebuffer changes quickly. The damage is
+visible on the physical panel as transient black rectangles, but does
+not appear in Chromium captures. Forcing the same workload through a
+linear framebuffer eliminates the corruption.
+
+Do not advertise AFBC modifiers for the Superbird primary plane. Other
+G12A boards retain AFBC support, and Superbird keeps the GL renderer and
+hardware composition while using linear scanout buffers.
+
+Upstream-Status: Inappropriate [board-specific hardware limitation]
+Signed-off-by: Neel Patel <108803410+68p@users.noreply.github.com>
+---
+ drivers/gpu/drm/meson/meson_plane.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_plane.c b/drivers/gpu/drm/meson/meson_plane.c
+index 4707599a6..c042a2712 100644
+--- a/drivers/gpu/drm/meson/meson_plane.c
++++ b/drivers/gpu/drm/meson/meson_plane.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/of.h>
+ #include <linux/soc/amlogic/meson-canvas.h>
+ 
+ #include <drm/drm_atomic.h>
+@@ -580,8 +581,13 @@ int meson_plane_create(struct meson_drm *priv)
+ 
+ 	if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_GXM))
+ 		format_modifiers = format_modifiers_afbc_gxm;
+-	else if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A))
+-		format_modifiers = format_modifiers_afbc_g12a;
++	else if (meson_vpu_is_compatible(priv, VPU_COMPATIBLE_G12A)) {
++		if (of_machine_is_compatible("spotify,superbird"))
++			dev_info(priv->dev,
++				 "AFBC scanout disabled on Superbird\n");
++		else
++			format_modifiers = format_modifiers_afbc_g12a;
++	}
+ 
+ 	ret = drm_universal_plane_init(priv->drm, plane, 0xFF,
+ 					&meson_plane_funcs,
+-- 
+2.54.0

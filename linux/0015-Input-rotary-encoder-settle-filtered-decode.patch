@@ -1,0 +1,176 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Sun, 01 Jun 2026 02:05:00 -0400
+Subject: [PATCH] Input: rotary-encoder - settle-filter the half-period decode
+
+The Car Thing's mechanical encoder bounces extraordinarily hard.
+Direct /dev/mem sampling of the two gpio lines shows 200-600 raw
+gray-code edges per detent, almost all of it sub-100us chatter, with
+the true position only resting between bursts. Both lines bounce, so
+the chatter even produces illegal two-bit gray transitions. Decoding
+that stream edge-by-edge is hopeless: the stock half-period state
+machine latches direction from whatever intermediate state it samples
+mid-bounce and reports reversals, and a plain transition accumulator
+integrates the sampling bias into net backward drift (10 forward
+detents measured as 9 forward + 23 backward).
+
+Separate the chatter from real motion in the time domain instead. On
+every edge, sample the lines and arm a one-shot timer; only when the
+state has held still for a settle window do we treat it as a real
+position and fold its gray step into an accumulator, emitting one
+event per two net steps (the half-period rate). Captured waveforms put
+the chatter below 100us and real detent dwells - even mid-flick - above
+1ms, so a 750us window cleanly separates them: offline replay of slow
+and fast forward sweeps both decode to pure forward motion with zero
+reversals and zero dropped detents at 750us (500us leaks a reversal on
+slow, 1000us drops detents on fast). Because each detent's plateau is
+itself stable, this is a per-state deglitch, not a wait-for-stop, so it
+tracks fast spins instead of collapsing them the way a report-rate
+debounce does. Clockwise decodes as a -1 gray step and emits dir=+1,
+matching the previous decoder's sign so the wire behaviour is unchanged.
+
+The gpio_intc glitch filter (separate patch) stays as a cheap edge-rate
+cut, but it is sub-microsecond and cannot touch millisecond bounce;
+this is what actually makes the wheel usable. Only the half-period
+handler (selected by rotary-encoder,steps-per-period=2) is reworked.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+ drivers/input/misc/rotary_encoder.c | 73 ++++++++++++++++++++++++++---
+ 1 file changed, 65 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/input/misc/rotary_encoder.c b/drivers/input/misc/rotary_encoder.c
+--- a/drivers/input/misc/rotary_encoder.c
++++ b/drivers/input/misc/rotary_encoder.c
+@@ -22,9 +22,16 @@
+ #include <linux/of.h>
+ #include <linux/pm.h>
+ #include <linux/property.h>
++#include <linux/hrtimer.h>
++#include <linux/ktime.h>
++#include <linux/spinlock.h>
+ 
+ #define DRV_NAME "rotary-encoder"
+ 
++/* settle window: above the encoder's sub-ms contact bounce, below a detent dwell even mid-flick */
++#define ROTENC_SETTLE_NS	(750 * NSEC_PER_USEC)
++#define ROTENC_STEPS_PER_DETENT	2
++
+ enum rotary_encoder_encoding {
+ 	ROTENC_GRAY,
+ 	ROTENC_BINARY,
+@@ -51,6 +58,12 @@
+ 	signed char dir;	/* 1 - clockwise, -1 - CCW */
+ 
+ 	unsigned int last_stable;
++
++	unsigned int last_committed;
++	unsigned int pending;
++	int accum;
++	spinlock_t lock;
++	struct hrtimer settle_timer;
+ };
+ 
+ static unsigned int rotary_encoder_get_state(struct rotary_encoder *encoder)
+@@ -132,24 +145,69 @@
+ 	return IRQ_HANDLED;
+ }
+ 
+-static irqreturn_t rotary_encoder_half_period_irq(int irq, void *dev_id)
++static void rotary_encoder_cancel_settle(void *data)
+ {
+-	struct rotary_encoder *encoder = dev_id;
+-	unsigned int state;
++	struct rotary_encoder *encoder = data;
+ 
+-	guard(mutex)(&encoder->access_mutex);
++	hrtimer_cancel(&encoder->settle_timer);
++}
+ 
+-	state = rotary_encoder_get_state(encoder);
++static enum hrtimer_restart rotary_encoder_settle(struct hrtimer *t)
++{
++	struct rotary_encoder *encoder =
++		container_of(t, struct rotary_encoder, settle_timer);
++	signed char dir = 0;
++	unsigned int delta;
++	unsigned long flags;
++
++	/*
++	 * the state held still for one settle window, so treat it as a real
++	 * position and fold its gray step into the accumulator. the encoder
++	 * throws hundreds of edges per detent but the chatter is sub-ms, so
++	 * only genuine motion reaches here. CW decodes as a -1 gray step.
++	 */
++	spin_lock_irqsave(&encoder->lock, flags);
++	delta = (encoder->pending - encoder->last_committed) & 3;
++	encoder->last_committed = encoder->pending;
++	if (delta == 3)
++		encoder->accum++;
++	else if (delta == 1)
++		encoder->accum--;
++	if (encoder->accum >= ROTENC_STEPS_PER_DETENT) {
++		encoder->accum -= ROTENC_STEPS_PER_DETENT;
++		dir = 1;
++	} else if (encoder->accum <= -ROTENC_STEPS_PER_DETENT) {
++		encoder->accum += ROTENC_STEPS_PER_DETENT;
++		dir = -1;
++	}
++	spin_unlock_irqrestore(&encoder->lock, flags);
+ 
+-	if (state & 1) {
+-		encoder->dir = ((encoder->last_stable - state + 1) % 4) - 1;
+-	} else {
+-		if (state != encoder->last_stable) {
+-			rotary_encoder_report_event(encoder);
+-			encoder->last_stable = state;
+-		}
++	if (dir) {
++		encoder->dir = dir;
++		rotary_encoder_report_event(encoder);
+ 	}
+ 
++	return HRTIMER_NORESTART;
++}
++
++static irqreturn_t rotary_encoder_half_period_irq(int irq, void *dev_id)
++{
++	struct rotary_encoder *encoder = dev_id;
++	unsigned int state = rotary_encoder_get_state(encoder);
++	unsigned long flags;
++
++	/*
++	 * sample the line and (re)arm the settle timer; decoding is deferred
++	 * until the state holds still for a window, rejecting the per-detent
++	 * contact bounce instead of trying to decode through it.
++	 */
++	spin_lock_irqsave(&encoder->lock, flags);
++	encoder->pending = state;
++	spin_unlock_irqrestore(&encoder->lock, flags);
++
++	hrtimer_start(&encoder->settle_timer, ns_to_ktime(ROTENC_SETTLE_NS),
++		      HRTIMER_MODE_REL);
++
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -260,7 +318,16 @@
+ 		break;
+ 	case 2:
+ 		handler = &rotary_encoder_half_period_irq;
+-		encoder->last_stable = rotary_encoder_get_state(encoder);
++		spin_lock_init(&encoder->lock);
++		hrtimer_setup(&encoder->settle_timer, rotary_encoder_settle,
++			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++		err = devm_add_action_or_reset(dev,
++					       rotary_encoder_cancel_settle,
++					       encoder);
++		if (err)
++			return err;
++		encoder->last_committed = rotary_encoder_get_state(encoder);
++		encoder->pending = encoder->last_committed;
+ 		break;
+ 	case 1:
+ 		handler = &rotary_encoder_irq;
+-- 
+2.54.0

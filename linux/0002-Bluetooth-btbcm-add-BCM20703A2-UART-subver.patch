@@ -1,0 +1,73 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Subject: [PATCH] Bluetooth: btbcm: BCM20703A2 chip ID + post-Reset settle + tx-power quirk
+
+Three combined changes to make the Spotify Car Thing's BCM20703A2 BT
+controller work with mainline. The intended host attach path is
+userspace btattach + bcm protocol; the in-kernel hci_bcm serdev
+auto-bind path has independent issues that prevent it from working
+on this chip and is out of scope here.
+
+1. Add subver 0x220b -> "BCM20703A2" to bcm_uart_subver_table so the
+   firmware lookup picks brcm/BCM20703A2.hcd instead of falling
+   through to the generic brcm/BCM.hcd (which doesn't exist in
+   linux-firmware for this part).
+
+2. Add a 250 ms msleep after btbcm_reset in btbcm_initialize. The
+   chip ACKs the HCI_Reset command-complete event but its internal
+   state machine then needs ~200 ms before the UART will answer any
+   further command. Without the sleep, Read_Local_Version times out
+   (-ETIMEDOUT) and probe fails.
+
+3. Always set HCI_QUIRK_BROKEN_READ_TRANSMIT_POWER from
+   btbcm_print_controller_features. This chip's firmware build 0353
+   returns a 1-byte (status-only) command-complete for HCI_OP_LE_READ
+   _TRANSMIT_POWER (0x204b) instead of the 3-byte BT 5.0 response;
+   the generic LE init stage then aborts with -EOPNOTSUPP and
+   hci_dev_open fails before bring-up completes. Cost on unaffected
+   newer controllers is just less precise tx power reporting.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+diff --git a/drivers/bluetooth/btbcm.c b/drivers/bluetooth/btbcm.c
+index d33cc70ee..4ffa91cc6 100644
+--- a/drivers/bluetooth/btbcm.c
++++ b/drivers/bluetooth/btbcm.c
+@@ -469,6 +469,14 @@ static int btbcm_print_controller_features(struct hci_dev *hdev)
+ 	if (dmi_first_match(disable_broken_read_transmit_power))
+ 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_READ_TRANSMIT_POWER);
+
++	/* BCM20703A2 (Spotify Car Thing) firmware build 0353 returns a
++	 * 1-byte (status-only) command-complete for HCI_OP_LE_READ_TRANSMIT
++	 * _POWER (0x204b) instead of the 3-byte BT 5.0 response. Without
++	 * the quirk the LE init aborts with -EOPNOTSUPP. Set unconditionally:
++	 * cost on unaffected newer controllers is just less precise tx power.
++	 */
++	hci_set_quirk(hdev, HCI_QUIRK_BROKEN_READ_TRANSMIT_POWER);
++
+ 	return 0;
+ }
+
+@@ -515,6 +523,7 @@ static const struct bcm_subver_table bcm_uart_subver_table[] = {
+ 	{ 0x4106, "BCM4335A0"	},	/* 002.001.006 */
+ 	{ 0x410c, "BCM43430B0"	},	/* 002.001.012 */
+ 	{ 0x2119, "BCM4373A0"	},	/* 001.001.025 */
++	{ 0x220b, "BCM20703A2"	},	/* 001.002.011 - Spotify Car Thing */
+ 	{ }
+ };
+
+@@ -585,6 +594,14 @@ int btbcm_initialize(struct hci_dev *hdev, bool *fw_load_done, bool use_autobaud
+ 	if (err)
+ 		return err;
+
++	/* Some Broadcom controllers (BCM20703A2 in the Spotify Car Thing
++	 * confirmed) ACK HCI_Reset's command-complete event but their
++	 * internal state machine then needs ~200 ms before the UART will
++	 * answer any further command. Without this delay, Read_Local_Version
++	 * times out (-ETIMEDOUT) and probe fails.
++	 */
++	msleep(250);
++
+ 	/* Read Local Version Info */
+ 	skb = btbcm_read_local_version(hdev);
+ 	if (IS_ERR(skb))

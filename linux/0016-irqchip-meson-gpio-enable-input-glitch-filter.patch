@@ -1,0 +1,52 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Sat, 31 May 2026 14:26:00 -0400
+Subject: [PATCH] irqchip/meson-gpio: enable the input glitch filter on every
+ channel
+
+The meson8-family gpio_intc has a per-channel input glitch filter
+(REG_FILTER_SEL, 4 bits per channel) that requires the input to be
+stable for N filter-clock cycles before an edge propagates to the GIC.
+Mainline defines the register but never writes it, so the filter sits
+at reset (0 = no debounce) and every contact glitch on a pin becomes
+an interrupt. The stock Amlogic gpio_intc driver programmed this field
+to its maximum (0x7) on every channel; the filter is what let stock
+run a bouncy mechanical rotary encoder cleanly.
+
+Program the same 0x7 in the meson8 set_type path so it applies to each
+channel as it is configured. This rejects sub-window glitches at the
+controller without throttling legitimate edges, which is what the
+software report debounce in the rotary-encoder driver cannot do (that
+only rate-limits reports). The two together reproduce the bounce
+rejection stock relied on. Only the meson8 register layout carries
+REG_FILTER_SEL; the s4 path uses a different register block and is
+untouched.
+
+The filter is harmless to the other consumers on this controller
+(touch and proximity IRQs) - a few cycles of debounce on those lines
+is at worst invisible. The exact time constant follows the
+controller's default filter clock, which is the same clock stock's
+0x7 ran against.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+ drivers/irqchip/irq-meson-gpio.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/irqchip/irq-meson-gpio.c b/drivers/irqchip/irq-meson-gpio.c
+--- a/drivers/irqchip/irq-meson-gpio.c
++++ b/drivers/irqchip/irq-meson-gpio.c
+@@ -372,6 +372,11 @@
+ 	meson_gpio_irq_update_bits(ctl, REG_EDGE_POL,
+ 				   REG_EDGE_POL_MASK(params, idx), val);
+ 
++	/* max glitch filter; bare gpio_intc edges are unfiltered and a mechanical encoder bounces hard */
++	meson_gpio_irq_update_bits(ctl, REG_FILTER_SEL,
++				   0x7 << REG_FILTER_SEL_SHIFT(idx),
++				   0x7 << REG_FILTER_SEL_SHIFT(idx));
++
+ 	return 0;
+ }
+ 
+-- 
+2.54.0

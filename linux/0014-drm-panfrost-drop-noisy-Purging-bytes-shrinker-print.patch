@@ -1,0 +1,35 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Thu, 30 Apr 2026 20:56:32 -0400
+Subject: [PATCH] drm/panfrost: drop noisy 'Purging X bytes' shrinker print
+
+The pr_info_ratelimited at the tail of panfrost_gem_shrinker_scan fires
+every time the shrinker frees pages, which on a 512 MB device with
+chromium driving Panfrost is constant. The rate-limit's own 'callbacks
+suppressed' summary then prints to console too. Drop the line - the
+shrinker is core-path infrastructure, the freed count is already
+returned to the caller, and KERN_INFO console spam from a kiosk
+runtime is a regression that masks real warnings.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+ drivers/gpu/drm/panfrost/panfrost_gem_shrinker.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_gem_shrinker.c b/drivers/gpu/drm/panfrost/panfrost_gem_shrinker.c
+index 2fe967a90..95dace974 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_gem_shrinker.c
++++ b/drivers/gpu/drm/panfrost/panfrost_gem_shrinker.c
+@@ -83,9 +83,6 @@ panfrost_gem_shrinker_scan(struct shrinker *shrinker, struct shrink_control *sc)
+ 
+ 	mutex_unlock(&pfdev->shrinker_lock);
+ 
+-	if (freed > 0)
+-		pr_info_ratelimited("Purging %lu bytes\n", freed << PAGE_SHIFT);
+-
+ 	return freed;
+ }
+ 
+-- 
+2.54.0
+

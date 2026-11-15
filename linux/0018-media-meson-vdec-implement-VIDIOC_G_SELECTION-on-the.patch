@@ -1,0 +1,79 @@
+From 6418d02c2a930715f757dc798611e8007906016b Mon Sep 17 00:00:00 2001
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Wed, 29 Jul 2026 21:30:00 -0400
+Subject: [PATCH] media: meson: vdec: implement VIDIOC_G_SELECTION on the
+ CAPTURE queue
+
+The stateful decoder uAPI requires a decoder to report the visible
+rectangle of a decoded frame through VIDIOC_G_SELECTION on the CAPTURE
+queue, using the V4L2_SEL_TGT_COMPOSE family of targets. meson-vdec
+never implemented any selection target, so the ioctl returns -ENOTTY.
+
+Clients that follow the documented initialization sequence treat that as
+fatal. Chromium's V4L2StatefulVideoDecoder calls GetVisibleRect() right
+after it has picked a CAPTURE format in response to the driver's
+V4L2_EVENT_SOURCE_CHANGE, and abandons CAPTURE queue setup when it
+fails. The result is a decoder that negotiates a format, accepts and
+returns every OUTPUT buffer, and never dequeues a single frame, with no
+error reported anywhere.
+
+The driver has no scaler and does no cropping, so the visible rectangle
+is the whole picture and all four COMPOSE targets resolve to the same
+rectangle that VIDIOC_G_FMT already reports.
+
+Upstream-Status: Pending
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+---
+ drivers/staging/media/meson/vdec/vdec.c | 29 +++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 4b77ec1..7f1a3c2 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -776,6 +776,34 @@ static int vdec_g_pixelaspect(struct file *file, void *fh, int type,
+ 	return 0;
+ }
+ 
++static int vdec_g_selection(struct file *file, void *fh,
++			    struct v4l2_selection *s)
++{
++	struct amvdec_session *sess = file_to_amvdec_session(file);
++
++	/* v4l2_ioctl.c maps the _MPLANE type down before we are called. */
++	if (s->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
++		return -EINVAL;
++
++	switch (s->target) {
++	case V4L2_SEL_TGT_COMPOSE:
++	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
++	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
++	case V4L2_SEL_TGT_COMPOSE_PADDED:
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	/* no scaler and no cropping: the visible rect is the whole picture */
++	s->r.left = 0;
++	s->r.top = 0;
++	s->r.width = sess->width;
++	s->r.height = sess->height;
++
++	return 0;
++}
++
+ static const struct v4l2_ioctl_ops vdec_ioctl_ops = {
+ 	.vidioc_querycap = vdec_querycap,
+ 	.vidioc_enum_fmt_vid_cap = vdec_enum_fmt,
+@@ -801,6 +829,7 @@ static const struct v4l2_ioctl_ops vdec_ioctl_ops = {
+ 	.vidioc_try_decoder_cmd = v4l2_m2m_ioctl_try_decoder_cmd,
+ 	.vidioc_decoder_cmd = vdec_decoder_cmd,
+ 	.vidioc_g_pixelaspect = vdec_g_pixelaspect,
++	.vidioc_g_selection = vdec_g_selection,
+ };
+ 
+ static int m2m_queue_init(void *priv, struct vb2_queue *src_vq,
+-- 
+2.53.0
+

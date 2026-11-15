@@ -1,0 +1,66 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Mon, 27 Apr 2026 15:11:05 -0400
+Subject: [PATCH 3/5] drm/meson: realign DW MIPI DSI lane-byte counter on
+ bootloader handoff
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the bootloader hands off a running DSI host, the DW host's
+internal lane-byte counter - the per-line state machine that lays the
+24bpp R G B byte stream onto the MIPI lanes - comes up at a random
+byte offset on each cold boot. With the mod-3 counter starting at 0,
+1, or 2 the panel sees R G B / G B R / B R G respectively, and the
+matching pixel-counter mis-alignment shows up as a horizontal shift
+on a vertical-stripe test pattern.
+
+In meson_dw_mipi_dsi_probe's bootloader-up branch, toggle DSI_PWR_UP
+(write SHUTDOWNZ=0, brief delay, write SHUTDOWNZ=1). The host's state
+machines reset without touching PHY_RSTZ; the PHY stays locked, the
+encoder keeps clocking pixels, and on the next HSYNC the host re-emits
+the long-packet header at lane-byte 0. The panel sees one frame of
+disrupted output (a brief dim flicker on a still-lit backlight) and
+the colour and offset are deterministic from then on.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+ drivers/gpu/drm/meson/meson_dw_mipi_dsi.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c b/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c
+index 10b8f527b..3fe2e9880 100644
+--- a/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c
++++ b/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c
+@@ -350,6 +350,29 @@ static int meson_dw_mipi_dsi_probe(struct platform_device *pdev)
+ 		reset_control_assert(mipi_dsi->top_rst);
+ 		usleep_range(10, 20);
+ 		reset_control_deassert(mipi_dsi->top_rst);
++	} else {
++		/*
++		 * The DW DSI host's lane-byte counter - the per-line state
++		 * machine that lays the 24bpp R G B byte stream onto the
++		 * MIPI lanes - comes up at a random byte offset on each
++		 * cold boot when the bootloader leaves the host running.
++		 * With the mod-3 byte counter starting at 0, 1, or 2 the
++		 * panel sees R G B / G B R / B R G respectively, producing
++		 * a cyclic colour permutation; the matching pixel-counter
++		 * mis-alignment shows up as a horizontal shift on a
++		 * vertical-stripe pattern.
++		 *
++		 * Toggling DSI_PWR_UP (write SHUTDOWNZ=0, brief delay,
++		 * write SHUTDOWNZ=1) clears the host state machines without
++		 * touching PHY_RSTZ. The PHY stays locked, the encoder
++		 * keeps clocking pixels, and on the next HSYNC the host
++		 * re-emits the long-packet header at lane-byte 0. The
++		 * panel sees one frame of disrupted output, which on a
++		 * still-lit backlight reads as a brief dim flicker.
++		 */
++		writel_relaxed(0, mipi_dsi->base + 0x04);
++		usleep_range(10, 20);
++		writel_relaxed(1, mipi_dsi->base + 0x04);
+ 	}
+
+ 	/* MIPI DSI Controller */
+--
+2.54.0

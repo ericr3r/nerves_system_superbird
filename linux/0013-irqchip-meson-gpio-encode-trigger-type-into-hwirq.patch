@@ -1,0 +1,220 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Thu, 30 Apr 2026 00:50:43 -0400
+Subject: [PATCH] irqchip/meson-gpio: encode trigger type into hwirq for
+ multi-edge consumers
+
+Mainline irq-meson-gpio.c rejects IRQ_TYPE_EDGE_BOTH on controllers
+that don't natively sample both edges of a channel (axg/g12a) and
+relies on irq_find_mapping's hwirq-only dedup, so a consumer cannot
+get both edges of one gpio line by listing it twice in
+"interrupts-extended" with opposite polarities - the second mapping
+just collapses onto the first virq.
+
+Synthesize a per-(line,type) hwirq in the controller's translate op
+by encoding the trigger type into the upper half of the hwirq value.
+The synthetic key bypasses irq_find_mapping's dedup so distinct
+edges of the same line each get their own virq, their own gpio_intc
+channel and their own GIC parent. The HW-programming paths
+(request_channel/sel_pin) only see the real (lower-half) hwirq.
+The domain switches to a tree-based mapping so the synthetic keys
+that exceed nr_hwirq don't get refused by the linear table.
+
+Pair this with rotary-encoder support for an arbitrary IRQ count:
+when the device's "interrupts" property carries more entries than
+the "gpios" array (the dual-edge case), platform_irq_count drives
+the IRQ-request loop instead of encoder->gpios->ndescs. The trigger
+type is taken from DT and not overridden in software, so consumers
+that only have legacy gpiod_to_irq (no DT interrupts) still get
+IRQF_TRIGGER_RISING|IRQF_TRIGGER_FALLING applied. The state machine
+reads GPIO levels on every IRQ and is indifferent to which edge
+fired, so registering the same handler against multiple IRQs is
+safe.
+
+Together this lets a 2-channel quadrature rotary encoder catch every
+gray-code transition on G12A: one DT entry per (line, edge), four
+gpio_intc channels burned, and the existing half_period state
+machine sees the full sequence instead of skipping past unobserved
+intermediate positions.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+ drivers/input/misc/rotary_encoder.c | 54 +++++++++++++++++++----------
+ drivers/irqchip/irq-meson-gpio.c    | 42 +++++++++++++++++++---
+ 2 files changed, 73 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/input/misc/rotary_encoder.c b/drivers/input/misc/rotary_encoder.c
+index 7ab01c208..41cfd119b 100644
+--- a/drivers/input/misc/rotary_encoder.c
++++ b/drivers/input/misc/rotary_encoder.c
+@@ -183,6 +183,8 @@ static int rotary_encoder_probe(struct platform_device *pdev)
+ 	irq_handler_t handler;
+ 	u32 steps_per_period;
+ 	unsigned int i;
++	unsigned int nr_irqs;
++	int dt_irq_count;
+ 	int err;
+ 
+ 	encoder = devm_kzalloc(dev, sizeof(struct rotary_encoder), GFP_KERNEL);
+@@ -269,36 +271,50 @@ static int rotary_encoder_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * The driver requests one IRQ per entry in either the gpiod-derived
++	 * IRQ list or the device's "interrupts"/"interrupts-extended" DT
++	 * property. Boards that need both edges of a single line on an IRQ
++	 * controller without native edge-both support (e.g. Amlogic G12A
++	 * gpio_intc) can list the line twice with opposite IRQ_TYPE_EDGE_*
++	 * polarities; the gray-code state machine reads GPIO levels on
++	 * every IRQ and doesn't care which edge fired.
++	 *
++	 * platform_irq_count() returns the total number of "interrupts"
++	 * cells in DT, which can exceed encoder->gpios->ndescs in that
++	 * dual-edge case. When DT doesn't provide any interrupts (or this
++	 * is a non-DT platform), fall back to gpiod_to_irq per gpio with
++	 * IRQF_TRIGGER_{RISING,FALLING} forced on - that's the legacy path
++	 * that predates the DT-driven configuration.
++	 */
++	dt_irq_count = platform_irq_count(pdev);
++	if (dt_irq_count > 0)
++		nr_irqs = dt_irq_count;
++	else
++		nr_irqs = encoder->gpios->ndescs;
++
+ 	encoder->irq =
+ 		devm_kcalloc(dev,
+-			     encoder->gpios->ndescs, sizeof(*encoder->irq),
++			     nr_irqs, sizeof(*encoder->irq),
+ 			     GFP_KERNEL);
+ 	if (!encoder->irq)
+ 		return -ENOMEM;
+ 
+-	for (i = 0; i < encoder->gpios->ndescs; ++i) {
++	for (i = 0; i < nr_irqs; ++i) {
+ 		unsigned long irqflags = IRQF_ONESHOT;
+-		int irq = gpiod_to_irq(encoder->gpios->desc[i]);
+-
+-		if (irq < 0) {
+-			/*
+-			 * Some gpiochips (e.g. Amlogic Meson) don't implement
+-			 * .to_irq, so gpiod_to_irq() returns -ENXIO. Allow
+-			 * boards to wire IRQs explicitly via the device's
+-			 * "interrupts"/"interrupts-extended" properties; the
+-			 * indices match the order of "gpios". When the IRQ
+-			 * came from DT, trust the trigger type already set
+-			 * via the interrupts cells - forcing EDGE_BOTH here
+-			 * would override that and fails on IRQ controllers
+-			 * that don't support edge-both (e.g. Amlogic G12A).
+-			 */
+-			irq = fwnode_irq_get(dev_fwnode(dev), i);
++		int irq;
++
++		if (dt_irq_count > 0) {
++			irq = platform_get_irq(pdev, i);
++			if (irq < 0)
++				return irq;
++		} else {
++			irq = gpiod_to_irq(encoder->gpios->desc[i]);
+ 			if (irq < 0) {
+ 				dev_err(dev, "no IRQ available for gpio#%d\n",
+ 					i);
+ 				return irq;
+ 			}
+-		} else {
+ 			irqflags |= IRQF_TRIGGER_RISING |
+ 				    IRQF_TRIGGER_FALLING;
+ 		}
+@@ -308,7 +324,7 @@ static int rotary_encoder_probe(struct platform_device *pdev)
+ 				NULL, handler, irqflags,
+ 				DRV_NAME, encoder);
+ 		if (err) {
+-			dev_err(dev, "unable to request IRQ %d (gpio#%d)\n",
++			dev_err(dev, "unable to request IRQ %d (#%d)\n",
+ 				encoder->irq[i], i);
+ 			return err;
+ 		}
+diff --git a/drivers/irqchip/irq-meson-gpio.c b/drivers/irqchip/irq-meson-gpio.c
+index f722e9c57..af20b28e9 100644
+--- a/drivers/irqchip/irq-meson-gpio.c
++++ b/drivers/irqchip/irq-meson-gpio.c
+@@ -465,14 +465,32 @@ static struct irq_chip meson_gpio_irq_chip = {
+ 	.flags			= IRQCHIP_SET_TYPE_MASKED,
+ };
+ 
++/*
++ * Encode the trigger type bits into the upper half of the hwirq passed
++ * up to irqdomain. irq_find_mapping() dedups solely on hwirq, so listing
++ * the same gpio_intc input line twice in "interrupts-extended" with
++ * different IRQ_TYPE_EDGE_* polarities would otherwise collapse to a
++ * single virq. Synthesizing a per-(line,type) hwirq lets a consumer
++ * request both edges of one line by spelling them out as separate DT
++ * entries, each backed by its own gpio_intc channel.
++ *
++ * The synthetic value never reaches the controller's HW-programming
++ * paths - meson_gpio_irq_domain_alloc strips the type bits before
++ * calling sel_pin/request_channel.
++ */
++#define MESON_GPIO_IRQ_HWIRQ_TYPE_SHIFT	16
++#define MESON_GPIO_IRQ_HWIRQ_REAL_MASK	GENMASK(15, 0)
++
+ static int meson_gpio_irq_domain_translate(struct irq_domain *domain,
+ 					   struct irq_fwspec *fwspec,
+ 					   unsigned long *hwirq,
+ 					   unsigned int *type)
+ {
+ 	if (is_of_node(fwspec->fwnode) && fwspec->param_count == 2) {
+-		*hwirq	= fwspec->param[0];
+ 		*type	= fwspec->param[1];
++		*hwirq	= fwspec->param[0] |
++			  (((unsigned long)*type & IRQ_TYPE_SENSE_MASK) <<
++			   MESON_GPIO_IRQ_HWIRQ_TYPE_SHIFT);
+ 		return 0;
+ 	}
+ 
+@@ -503,6 +521,7 @@ static int meson_gpio_irq_domain_alloc(struct irq_domain *domain,
+ 	struct irq_fwspec *fwspec = data;
+ 	struct meson_gpio_irq_controller *ctl = domain->host_data;
+ 	unsigned long hwirq;
++	unsigned long real_hwirq;
+ 	u32 *channel_hwirq;
+ 	unsigned int type;
+ 	int ret;
+@@ -514,7 +533,16 @@ static int meson_gpio_irq_domain_alloc(struct irq_domain *domain,
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = meson_gpio_irq_request_channel(ctl, hwirq, &channel_hwirq);
++	/*
++	 * The synthetic hwirq carries the trigger type in its upper bits
++	 * so the irqdomain bookkeeping doesn't dedup distinct edges of the
++	 * same line. The controller's pin-mux register only takes the real
++	 * hwirq, so strip the type bits before asking the channel allocator
++	 * to program HW.
++	 */
++	real_hwirq = hwirq & MESON_GPIO_IRQ_HWIRQ_REAL_MASK;
++
++	ret = meson_gpio_irq_request_channel(ctl, real_hwirq, &channel_hwirq);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -617,8 +645,14 @@ static int meson_gpio_irq_probe(struct platform_device *pdev, struct device_node
+ 	if (ret)
+ 		goto free_channel_irqs;
+ 
+-	domain = irq_domain_create_hierarchy(parent_domain, 0,
+-					     ctl->params->nr_hwirq,
++	/*
++	 * Use a tree-based mapping (size = 0) instead of a linear array
++	 * sized to nr_hwirq. The synthetic hwirqs we hand out from
++	 * meson_gpio_irq_domain_translate carry trigger-type bits in the
++	 * upper half, so the keys can exceed nr_hwirq; a linear table sized
++	 * to nr_hwirq would refuse those keys outright.
++	 */
++	domain = irq_domain_create_hierarchy(parent_domain, 0, 0,
+ 					     of_fwnode_handle(node),
+ 					     &meson_gpio_irq_domain_ops,
+ 					     ctl);
+-- 
+2.54.0
+

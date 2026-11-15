@@ -1,0 +1,835 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: nerves_system_superbird <build@nerves>
+Date: Thu, 1 Jan 1970 00:00:00 +0000
+Subject: [PATCH] arm64: dts: amlogic: add meson-g12a-superbird
+
+Add the Spotify Car Thing (Superbird) board device tree. Generated from
+device_tree/meson-g12a-superbird.dts by tools/gen-dts-patch.sh; kept in
+sync with the yocto-superbird recipe.
+---
+ arch/arm64/boot/dts/amlogic/meson-g12a-superbird.dts | 816 ++++++++++
+ 1 file changed, 816 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/amlogic/meson-g12a-superbird.dts
+
+diff --git a/arch/arm64/boot/dts/amlogic/meson-g12a-superbird.dts b/arch/arm64/boot/dts/amlogic/meson-g12a-superbird.dts
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/arch/arm64/boot/dts/amlogic/meson-g12a-superbird.dts
+@@ -0,0 +1,816 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Device tree for the Spotify Car Thing (Superbird).
++ * SoC: Amlogic S905D2 (G12A family), Cortex-A53 x4, 512 MiB DDR3, 4 GiB eMMC.
++ *
++ * Phase 2b scope: UART console + eMMC. Everything else (DSI panel,
++ * tlsc6x touch, BCM20703A2 BT, MFi i2c, ALS, accel) comes in later phases.
++ */
++
++/dts-v1/;
++
++#include "meson-g12a.dtsi"
++#include <dt-bindings/clock/g12a-clkc.h>
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/gpio/meson-g12a-gpio.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/interrupt-controller/amlogic,meson-g12a-gpio-intc.h>
++#include <dt-bindings/interrupt-controller/arm-gic.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#include <dt-bindings/reset/amlogic,meson-g12a-reset.h>
++#include <dt-bindings/sound/meson-g12a-toacodec.h>
++
++/ {
++	compatible = "spotify,superbird", "amlogic,g12a";
++	model = "Spotify Car Thing (Superbird)";
++
++	aliases {
++		serial0 = &uart_AO;
++		serial1 = &uart_A;	/* BT chip - drives /dev/ttyAML1 deterministically */
++		mmc0 = &sd_emmc_c;
++		/*
++		 * Pin /dev/i2c-N numbering so userspace can hardcode bus paths.
++		 * The MFi i2c daemon expects /dev/i2c-3 in particular - without
++		 * an alias, the kernel auto-numbers in probe order and the MFi
++		 * bus could land on any free integer.
++		 */
++		i2c0 = &i2c0;	/* tlsc6x touchscreen */
++		i2c2 = &i2c2;	/* tmd2772 ambient light sensor */
++		i2c3 = &i2c3;	/* MFi authentication coprocessor */
++	};
++
++	chosen {
++		stdout-path = "serial0:115200n8";
++	};
++
++	memory@0 {
++		device_type = "memory";
++		reg = <0x0 0x0 0x0 0x20000000>;   /* 512 MiB single-rank, confirmed via BL2 log */
++	};
++
++	/* Block off u-boot's framebuffer so the page allocator can't hand
++	 * 0x1f800000-0x20000000 to anyone else while the OSD plane is still
++	 * scanning out the splash. u-boot env: fb_addr=0x1f800000,
++	 * fb_width=480, fb_height=800 (ThingLabs bootloader v1.0-40).
++	 *
++	 * Stock superbird_evt_512.dts uses 8 MiB; we mirror that for
++	 * headroom over the 1.5 MiB the panel actually consumes (480*800*4).
++	 *
++	 * "reusable" + "shared-dma-pool" means the region IS backed by RAM
++	 * and CAN be allocated from via dma_alloc_from_contiguous, but only
++	 * if a consumer (e.g. a DRM driver wired via memory-region) actively
++	 * requests it. With no consumer wired in mainline meson_drv, the
++	 * pool sits idle and nothing overwrites the splash pixels. */
++	reserved-memory {
++		/* meson-g12-common.dtsi asks for 256 MiB, which cannot be placed on a 512 MiB board once the
++		 * secure-monitor carveouts and the splash framebuffer are out, so the reservation fails and CMA
++		 * silently falls back to CONFIG_CMA_SIZE_MBYTES. 32 MiB cannot hold one decode session: the vdec
++		 * VIFIFO alone is 16 MiB, a VP9 workspace is 28.6 MiB, and a client's coded-input buffers are
++		 * another 32 MiB. 128 MiB fits all of that with slack for fragmentation, and CMA lends its free
++		 * pages to movable allocations, so this is not subtracted from usable RAM. */
++		linux,cma {
++			size = <0x0 0x8000000>;
++		};
++
++		logo_reserved: framebuffer@1f800000 {
++			/* no-map removes this range from the kernel's normal
++			 * RAM map entirely. The OSD scanner is hardware and
++			 * reads the physical address regardless of kernel
++			 * mappings, so the splash keeps displaying. /dev/mem
++			 * (with STRICT_DEVMEM off) can still mmap these pages
++			 * since they're tagged Reserved in iomem_resource. */
++			no-map;
++			reg = <0x0 0x1f800000 0x0 0x800000>;
++		};
++	};
++
++	emmc_pwrseq: emmc-pwrseq {
++		compatible = "mmc-pwrseq-emmc";
++		reset-gpios = <&gpio BOOT_12 GPIO_ACTIVE_LOW>;
++	};
++
++	main_3v3: regulator-main-3v3 {
++		compatible = "regulator-fixed";
++		regulator-name = "MAIN_3V3";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-always-on;
++	};
++
++	flash_1v8: regulator-flash-1v8 {
++		compatible = "regulator-fixed";
++		regulator-name = "FLASH_1V8";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		regulator-always-on;
++	};
++
++	dc_in: regulator-dc-in {
++		compatible = "regulator-fixed";
++		regulator-name = "DC_IN";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		regulator-always-on;
++	};
++
++	/* SY8120B1ABC PWM-controlled CPU regulator, driven on PWM_AO_D via
++	 * pwm_AO_cd channel 1. Same wiring as the sei510 reference board
++	 * and our u-boot DTS (lines 174-185). Range 721-1022 mV covers the
++	 * full G12A CPU OPP table (731-981 mV across 1.0-1.8 GHz). Hooking
++	 * this up is what makes cpufreq-dt actually scale voltage along
++	 * with frequency - without it the rail stays pinned at whatever
++	 * BL2 left it at and the higher OPPs are unsafe to step into. */
++	vddcpu: regulator-vddcpu {
++		compatible = "pwm-regulator";
++		regulator-name = "VDDCPU";
++		regulator-min-microvolt = <721000>;
++		regulator-max-microvolt = <1022000>;
++		pwm-supply = <&dc_in>;
++		pwms = <&pwm_AO_cd 1 1250 0>;
++		pwm-dutycycle-range = <100 0>;
++		regulator-boot-on;
++		regulator-always-on;
++	};
++
++	/* 480x800 MIPI DSI panel backlight.
++	 * GPIOH_4 = enable (stock "bl_enable", active-high),
++	 * GPIOH_5 = PWM_F (stock "bl_pwm", brightness control). */
++	backlight: backlight {
++		compatible = "pwm-backlight";
++		pwms = <&pwm_ef 1 50000 0>;	/* channel 1 = PWM_F, 50 kHz, active-high */
++		brightness-levels = <0 8 16 32 64 96 128 160 192 224 255>;
++		/*
++		 * default-brightness-level is the INDEX into the
++		 * interpolated levels table, not a value from
++		 * brightness-levels. With 11 entries and 16 interpolated
++		 * steps, num_levels = (11-1)*16 + 1 = 161, so
++		 * max_brightness = 160. Index 160 → pb->levels[160] = 255
++		 * → 100% PWM duty, matching u-boot's running state.
++		 * Keeps the kernel-side cached brightness sane through the
++		 * window between u-boot exit and ALS/systemd-backlight
++		 * taking over.
++		 */
++		default-brightness-level = <160>;
++		num-interpolated-steps = <16>;
++		enable-gpios = <&gpio GPIOH_4 GPIO_ACTIVE_HIGH>;
++		power-supply = <&main_3v3>;
++		pwm-bootloader-on;
++	};
++
++	/* Front-panel button cluster.
++	 * Polled because none of these pins are wired to GPIO IRQ lines on
++	 * the SoC pinmux (stock uses gpio-keys-polled at 40 ms). All buttons
++	 * have external pull-ups; we only set bias-disable + input-enable.
++	 * GPIOAO_3 (mute) is handled by the AO gpio bank and doesn't share
++	 * pinctrl with the periphs-bank pins below. */
++	gpio-keys-polled {
++		compatible = "gpio-keys-polled";
++		poll-interval = <40>;
++		pinctrl-0 = <&spotify_buttons_pins>;
++		pinctrl-names = "default";
++
++		button-preset1 {
++			label = "Preset 1";
++			linux,code = <KEY_1>;
++			gpios = <&gpio GPIOA_0 GPIO_ACTIVE_LOW>;
++		};
++		button-preset2 {
++			label = "Preset 2";
++			linux,code = <KEY_2>;
++			gpios = <&gpio GPIOA_1 GPIO_ACTIVE_LOW>;
++		};
++		button-preset3 {
++			label = "Preset 3";
++			linux,code = <KEY_3>;
++			gpios = <&gpio GPIOA_2 GPIO_ACTIVE_LOW>;
++		};
++		button-preset4 {
++			label = "Preset 4";
++			linux,code = <KEY_4>;
++			gpios = <&gpio GPIOA_3 GPIO_ACTIVE_LOW>;
++		};
++		button-mute {
++			label = "Mute";
++			linux,code = <KEY_M>;	/* stock keycode 50 == KEY_M */
++			gpios = <&gpio_ao GPIOAO_3 GPIO_ACTIVE_LOW>;
++		};
++		button-back {
++			label = "Back";
++			linux,code = <KEY_ESC>;
++			gpios = <&gpio GPIOA_5 GPIO_ACTIVE_LOW>;
++		};
++		button-select {
++			label = "Wheel Click";
++			linux,code = <KEY_ENTER>;
++			gpios = <&gpio GPIOZ_7 GPIO_ACTIVE_LOW>;
++		};
++	};
++
++	/* Rotary scroll wheel. GPIOZ_8 + GPIOZ_9 carry a quadrature/gray-code
++	 * signal; rotary-encoder driver decodes it into REL_HWHEEL events.
++	 *
++	 * G12A's gpio_intc dedups (hwirq, type) pairs in irq_find_mapping
++	 * the standard way (one virq per hwirq), so requesting both edges
++	 * of a single gpio line through one DT entry would force a single-
++	 * edge configuration. We list each gpio twice - once for RISING,
++	 * once for FALLING - and the rotary-encoder driver registers all
++	 * four IRQs with the same handler. The kernel state machine reads
++	 * GPIO levels on every IRQ, so it doesn't matter which edge fired.
++	 *
++	 * Catching every transition is required: a 2-channel quadrature
++	 * encoder's gray-code state machine has to see every state change
++	 * to track direction. Single-edge per line drops half the
++	 * transitions and lets the state machine mistake a forward click
++	 * for backward when state advances past an unobserved intermediate
++	 * position.
++	 *
++	 * The four entries burn four of the eight gpio_intc channels.
++	 */
++	rotary {
++		compatible = "rotary-encoder";
++		gpios = <&gpio GPIOZ_8 GPIO_ACTIVE_LOW>,
++			<&gpio GPIOZ_9 GPIO_ACTIVE_LOW>;
++		interrupts-extended =
++			<&gpio_intc IRQID_GPIOZ_8 IRQ_TYPE_EDGE_RISING>,
++			<&gpio_intc IRQID_GPIOZ_9 IRQ_TYPE_EDGE_RISING>,
++			<&gpio_intc IRQID_GPIOZ_8 IRQ_TYPE_EDGE_FALLING>,
++			<&gpio_intc IRQID_GPIOZ_9 IRQ_TYPE_EDGE_FALLING>;
++		linux,axis = <REL_HWHEEL>;
++		rotary-encoder,encoding = "gray";
++		rotary-encoder,relative-axis;
++		rotary-encoder,steps-per-period = <2>;
++		pinctrl-0 = <&spotify_rotary_pins>;
++		pinctrl-names = "default";
++	};
++
++	/* PDM mic-array codec stub. Superbird has 4 digital mics fed via two
++	 * PDM data lines (PDM_DIN0_A + PDM_DIN1_A), each line carrying a
++	 * stereo channel pair clocked off PDM_DCLK_A. */
++	dmics: audio-codec-pdm {
++		compatible = "dmic-codec";
++		#sound-dai-cells = <0>;
++		num-channels = <4>;
++		wakeup-delay-ms = <50>;
++		sound-name-prefix = "MIC";
++	};
++
++	sound {
++		compatible = "amlogic,axg-sound-card";
++		model = "Superbird";
++		audio-routing = "TODDR_A IN 4", "PDM Capture",
++				"TODDR_B IN 4", "PDM Capture";
++
++		clocks = <&clkc CLKID_MPLL2>,
++			 <&clkc CLKID_MPLL0>,
++			 <&clkc CLKID_MPLL1>;
++		assigned-clocks = <&clkc CLKID_MPLL2>,
++				  <&clkc CLKID_MPLL0>,
++				  <&clkc CLKID_MPLL1>;
++		assigned-clock-parents = <0>, <0>, <0>;
++		assigned-clock-rates = <294912000>,
++				       <270950400>,
++				       <393216000>;
++
++		dai-link-0 { sound-dai = <&toddr_a>; };
++		dai-link-1 { sound-dai = <&toddr_b>; };
++
++		/* 4-mic PDM array. */
++		dai-link-2 {
++			sound-dai = <&pdm>;
++			codec {
++				sound-dai = <&dmics>;
++			};
++		};
++	};
++};
++
++&uart_AO {
++	status = "okay";
++	pinctrl-0 = <&uart_ao_a_pins>;
++	pinctrl-names = "default";
++};
++
++&sd_emmc_c {
++	status = "okay";
++	pinctrl-0 = <&emmc_ctrl_pins>, <&emmc_data_8b_pins>, <&emmc_ds_pins>;
++	pinctrl-1 = <&emmc_clk_gate_pins>;
++	pinctrl-names = "default", "clk-gate";
++
++	bus-width = <8>;
++	cap-mmc-highspeed;
++	mmc-ddr-1_8v;
++	mmc-hs200-1_8v;
++	max-frequency = <200000000>;
++	non-removable;
++	disable-wp;
++
++	mmc-pwrseq = <&emmc_pwrseq>;
++	vmmc-supply = <&main_3v3>;
++	vqmmc-supply = <&flash_1v8>;
++};
++
++/* USB: dr_mode = "otg" makes the meson glue register a usb_role_switch so the
++ * single port can flip to host at runtime (/sys/class/usb_role). Boot role is
++ * device: the gadget path (DWC2 via usb2_phy1) is unchanged and host mode is a
++ * runtime opt-in, practical only behind a powered OTG hub since this port is
++ * also the board's power feed. Phy-supply points at main_3v3 - the G12A USB2
++ * phy driver just enables its supply regulator on probe, and the port takes
++ * VBUS from the upstream host, so no separate vbus-supply. */
++&usb2_phy1 {
++	phy-supply = <&main_3v3>;
++};
++
++&usb {
++	status = "okay";
++	dr_mode = "otg";
++};
++
++/* DWC2 peripheral-side FIFO layout. G12A reserves 712 dwords of dedicated
++ * SPRAM and the per-EP TX budget is total - g-rx-fifo-size - g-np-tx-fifo-size.
++ * The mainline default g-np-tx-fifo-size = <128> is sized for shared-FIFO
++ * mode; in dedicated mode (which we use) NP-TX only carries EP0 control,
++ * so 32 dwords is plenty.
++ *
++ * The g-tx-fifo-size array length is bound by the hardware's fifo_count
++ * (5 on this DWC2 instance: dmesg "EPs: 7, dedicated fifos"), not by how
++ * many IN endpoints our gadget actually uses. dwc2 reads up to 15 entries
++ * from the DT, zero-pads the rest, then dwc2_check_param_tx_fifo_sizes
++ * walks [1..fifo_count] and rejects any entry < min (16). Rejected entries
++ * get overwritten with the hardware's full per-FIFO depth, and the next
++ * dwc2_hsotg_init_fifo trips "insufficient fifo memory" and the UDC bind
++ * fails with -ENODEV. So: ALWAYS supply 5 entries, all >= 16, regardless
++ * of how many gadget functions we ship.
++ *
++ * Our composite is two bulk-IN (CDC-NCM, ADB) at 128 dwords (one HS
++ * maxpacket) and one interrupt-IN (NCM notify) at 16 dwords. dwc2's
++ * best-fit allocator picks slots by maxpacket so the two bulk-INs land
++ * in the 128-slots and the int-IN in a 16-slot. The trailing 128 is a
++ * reserve for a future bulk-IN function (mass_storage, ACM). Budget:
++ * 712 - 192 (rx) - 32 (np-tx) = 488 available, 416 reserved here.
++ */
++&dwc2 {
++	g-np-tx-fifo-size = <32>;
++	g-tx-fifo-size = <128 16 128 16 128>;
++};
++
++/*
++ * Efuse: read-only OTP block accessed via the secure-monitor bridge.
++ * meson-g12-common.dtsi already creates the node; we make it explicit
++ * here and define named nvmem-cells for the Spotify-specific layout the
++ * kernel cfg comment captures (BT MAC at offset 6, ASCII serial number
++ * at offset 18). Userspace can now read these via the nvmem subsystem:
++ *   /sys/bus/nvmem/devices/efuse0/cells/<cell-name>
++ * or via the DT nvmem-cells/nvmem-cell-names binding from a consumer
++ * driver. The bluetooth bring-up service can read bt_mac@6 instead of
++ * generating one from the serial.
++ */
++&efuse {
++	status = "okay";
++	#address-cells = <1>;
++	#size-cells = <1>;
++
++	bt_mac: bt-mac@6 {
++		reg = <0x6 0x6>;
++	};
++
++	serial_number: serial-number@12 {
++		reg = <0x12 0xc>;
++	};
++};
++
++/*
++ * GE2D: Amlogic 2D graphics accelerator. Mainline meson-g12-common.dtsi
++ * doesn't instantiate it (it's only in meson-axg.dtsi), so we add the
++ * node here as a child of &soc (where the MMIO range translates). Driver
++ * compatible matches the AXG variant; the IP block is the same on G12A
++ * but lives at a different SPI vector (146 on G12A vs 150 on AXG -
++ * verified via stock DTS). Exposes a v4l2-m2m device at /dev/videoN for
++ * color conversion, scaling, BitBLT and alpha blends.
++ */
++&{/soc} {
++	ge2d: ge2d@ff940000 {
++		compatible = "amlogic,axg-ge2d";
++		reg = <0x0 0xff940000 0x0 0x10000>;
++		interrupts = <GIC_SPI 146 IRQ_TYPE_EDGE_RISING>;
++		clocks = <&clkc CLKID_VAPB>;
++		resets = <&reset RESET_GE2D>;
++		status = "okay";
++	};
++};
++
++/* GPU: Mali-G31 (bifrost) driven by the in-tree Panfrost driver. Upstream
++ * meson-g12a.dtsi lists a gpu_opp_table with voltages from 0.80V to 0.88V; we
++ * do NOT have a separately-controllable mali-supply on Superbird (GPU rails
++ * are driven by the stock PMIC without an in-tree binding). Leaving
++ * mali-supply unset is deliberate - Panfrost warns about it on probe but
++ * still binds and runs at whatever the bootloader set the clock to. Attaching
++ * a fixed 3.3V regulator was worse: the OPP entries all rejected the voltage
++ * with -ERANGE and devfreq init failed, blocking GPU init entirely. */
++&mali {
++	status = "okay";
++};
++
++/* Display pipeline: VPU → DW-MIPI-DSI → ST7701S (480x800, 2 lanes, RGB565).
++ * The DSI host depends on mipi_dphy, which in turn depends on
++ * mipi_analog_dphy; both are disabled in meson-g12-common.dtsi and must be
++ * explicitly enabled per board. */
++&vpu {
++	status = "okay";
++
++	/* Wire the framebuffer reservation to the VPU node. Mainline
++	 * meson_drv doesn't currently call of_reserved_mem_device_init -
++	 * the property is a soft pointer that prevents some accidents and
++	 * documents the relationship; the actual "block off these pages"
++	 * effect comes from the reserved-memory entry above. If we add a
++	 * mainline patch to claim the pool at probe (matching stock
++	 * am_meson_vpu.c:801), this is the binding it expects. */
++	memory-region = <&logo_reserved>;
++
++	/* Shrink the VPU reg range from mainline's full 1 MiB
++	 * (0xff900000-0xff9fffff) down to 256 KiB (0xff900000-0xff93ffff)
++	 * so the GE2D node below can claim its own 64 KiB window at
++	 * 0xff940000. meson-drm's largest accessed offset is ~0xf6f4
++	 * (VPU_RDARB_REQEN_SLV_L1C2 area), well within the truncated
++	 * range. Without this shrink, request_mem_region for VPU's full
++	 * 1 MiB blocks GE2D from binding (and vice-versa) since the
++	 * regions overlap. The HHI window at 0xff63c000 stays unchanged.
++	 */
++	reg = <0x0 0xff900000 0x0 0x40000>,
++	      <0x0 0xff63c000 0x0 0x1000>;
++};
++
++&mipi_analog_dphy {
++	status = "okay";
++};
++
++&mipi_dphy {
++	status = "okay";
++};
++
++&pwm_ef {
++	status = "okay";
++	pinctrl-0 = <&pwm_f_h_pins>;	/* GPIOH_5 → PWM_F */
++	pinctrl-names = "default";
++	clocks = <&xtal>;
++	clock-names = "clkin1";
++};
++
++&mipi_dsi {
++	status = "okay";
++
++	/*
++	 * DSI HS bit rate = mode->clock × bpp / lanes
++	 * = 27.918 MHz × 24 / 2 = 334.716 Mbps/lane.
++	 *
++	 * The g12a MIPI_DSI_PXCLK divider table is hard-coded to div=1, so
++	 * the "bit" clock always equals gp0_pll. When dw_mipi_dsi's
++	 * phy_init calls clk_set_rate(bit_clk, 334716000) we need gp0_pll
++	 * to actually retune to that rate - which means we must NOT pin it
++	 * here. The previous 936 MHz assignment from mnt-reform2 pinned
++	 * gp0_pll at a rate the DW PHY's PLL cannot lock to for our mode,
++	 * producing "failed to wait phy lock state" and a dark panel.
++	 *
++	 * We only pre-set a seed rate that a) the PLL can reach and b) the
++	 * ENCL pixel-clock side can divide down to ~27.918 MHz (vclk2_div
++	 * integer divisor 12 → 27.893 MHz, 0.09% off). This avoids the
++	 * devm_clk_get_enabled("bit") -EIO at probe that happens when the
++	 * clock has rate=0, while still letting dw_mipi_dsi's runtime
++	 * clk_set_rate succeed (matching rate → no-op).
++	 */
++	/* Match stock's clock topology: u-boot sets BOTH vclk2_sel and
++	 * mipi_dsi_pxclk_sel to vid_pll (HDMI_PLL-sourced) - verified
++	 * 2026-04-26 via adb on a stock-firmware Superbird:
++	 *   HHI_VIID_CLK_CNTL[18:16]   = 0  (vclk2_sel = vid_pll)
++	 *   HHI_MIPIDSI_PHY_CLK_CNTL[14:12] = 0  (pxclk_sel = vid_pll)
++	 *
++	 * Reparenting either to gp0_pll triggers a clock-tree re-lock during
++	 * kernel probe, producing the variable boot-time horizontal wrap on
++	 * test patterns. We leave both muxes alone but DO keep the
++	 * cts_encl_sel parent assignment - that's what holds the vclk2
++	 * chain enabled in the CCF (otherwise CCF gates vclk2_div off and
++	 * the encoder loses its pixel clock).
++	 */
++	assigned-clocks = <&clkc CLKID_GP0_PLL>,
++			  <&clkc CLKID_CTS_ENCL_SEL>;
++	assigned-clock-parents = <0>,
++				 <&clkc CLKID_VCLK2_DIV1>;
++	assigned-clock-rates = <334716000>, <0>;
++
++	panel: panel@0 {
++		compatible = "spotify,superbird-panel";
++		reg = <0>;
++
++		/* GPIO_ACTIVE_HIGH matches the st7701 driver's convention: its
++		 * prepare() calls gpiod_set_value(reset, 0) then (reset, 1),
++		 * with the panel expected to be released-from-reset when 1.
++		 * Mainline reference: rk3326-odroid-go3.dts with kd50t048a. */
++		reset-gpios = <&gpio GPIOZ_5 GPIO_ACTIVE_HIGH>;
++		backlight = <&backlight>;
++
++		/* ST7701 driver requires VCC and IOVCC regulators; Superbird's
++		 * panel is fed from the always-on 3.3 V rail, so both point at
++		 * the same fixed regulator. */
++		VCC-supply = <&main_3v3>;
++		IOVCC-supply = <&main_3v3>;
++
++		port {
++			panel_in: endpoint {
++				remote-endpoint = <&mipi_out>;
++			};
++		};
++	};
++};
++
++&mipi_dsi_panel_port {
++	mipi_out: endpoint {
++		remote-endpoint = <&panel_in>;
++	};
++};
++
++/*
++ * Bluetooth: BCM20703A2 on uart_A. Userspace bring-up path -
++ * /dev/ttyAML1 stays as a plain tty so the superbird-bluetooth
++ * service can pulse REG_ON (GPIOX_17) and exec `btattach -P bcm`
++ * (matches stock 4.9 + nixos-superbird). uart-has-rtscts is
++ * required: with RTS unmuxed/floating the chip's CTS sees "host
++ * not ready" and won't TX. The BCM20703A2 chip-id and post-Reset
++ * settle live in btbcm.c via patch 0002.
++ *
++ * The mainline hci_bcm serdev auto-bind path was tried (with the
++ * full set of patches: subver entry, post-Reset settle, tx-power
++ * quirk, no_early_set_baudrate of_match entry, longer post-power
++ * wait) - chip still silent on Read_Local_Version. The userspace
++ * btattach path works on the same kernel + same chip, so we use it.
++ */
++&uart_A {
++	status = "okay";
++	pinctrl-0 = <&spotify_uart_a_pins>, <&uart_a_cts_rts_pins>;
++	pinctrl-names = "default";
++	uart-has-rtscts;
++	fifo-size = <128>;
++	/* xtal/2 divisor mode (G12A default): 3M = 12M/4 exact, 4 sample
++	 * periods/bit, the clean operating point the BT baud bump targets. */
++};
++
++/*
++ * Touchscreen I2C bus - TLSC6x capacitive controller at 0x2e on i2c0.
++ * Stock used pins GPIOZ_0 (SDA) + GPIOZ_1 (SCK). Reset and IRQ are on
++ * GPIOZ_3 / GPIOZ_4 respectively (separate from i2c0 - those Z-bank
++ * pins live in the same pinmux bank but aren't muxed for i2c0). The
++ * chip's IRQ goes through gpio_intc; G12A's axg_params doesn't
++ * support EDGE_BOTH, so we pick FALLING to match the active-low INT
++ * line the chip drives.
++ */
++&i2c0 {
++	status = "okay";
++	pinctrl-0 = <&i2c0_sda_z0_pins>, <&i2c0_sck_z1_pins>;
++	pinctrl-names = "default";
++	clock-frequency = <400000>;
++
++	touchscreen@2e {
++		compatible = "telink,tlsc6x";
++		reg = <0x2e>;
++		reset-gpios = <&gpio GPIOZ_3 GPIO_ACTIVE_HIGH>;
++		interrupts-extended = <&gpio_intc IRQID_GPIOZ_4 IRQ_TYPE_EDGE_FALLING>;
++		pinctrl-0 = <&spotify_touch_pins>;
++		pinctrl-names = "default";
++		vdd-supply = <&main_3v3>;
++		vddio-supply = <&main_3v3>;
++		touchscreen-size-x = <480>;
++		touchscreen-size-y = <800>;
++	};
++};
++
++/*
++ * Sensor I2C bus - TMD2772 ALS sits at 0x39. Stock DTS also lists a
++ * LIS2DH12 accelerometer at 0x18 and a max20332 at 0x35, but the accel
++ * pad is unpopulated (DNP) on shipped hardware and max20332 has no
++ * mainline driver, so we wire only the ALS. Bus runs at 400 kHz (stock).
++ */
++&i2c2 {
++	status = "okay";
++	pinctrl-0 = <&i2c2_sda_z_pins>, <&i2c2_sck_z_pins>;
++	pinctrl-names = "default";
++	clock-frequency = <400000>;
++
++	light-sensor@39 {
++		compatible = "amstaos,tmd2772";
++		reg = <0x39>;
++		vdd-supply = <&main_3v3>;
++		vddio-supply = <&main_3v3>;
++		/*
++		 * Proximity path: the chip is a combined ALS + active-IR
++		 * proximity part. Stock disabled prox at runtime via the
++		 * non-standard `enable-proxy = "false"` (ignored by mainline),
++		 * but the IR LED + photodiode are physical and the chip
++		 * supports both channels concurrently.
++		 *
++		 * `proximity-diodes = <1>` selects IR LED #1 - also the driver
++		 * default. If the value here ever reads ~0 even with a finger
++		 * over the bezel, try <0> or <0 1> to drive the other diode
++		 * (depends on PCB optical placement, which Spotify never
++		 * documented - empirical pick).
++		 *
++		 * GPIOZ_10 is wired to the chip's INT pin. Hooking it up
++		 * lets userspace `poll()` an event fd from
++		 * /sys/.../events/in_proximity0_thresh_either_en instead of
++		 * polling sysfs. EDGE_FALLING because the chip pulls INT
++		 * low when an event fires, releases on event-clear; G12A's
++		 * gpio_intc rejects EDGE_BOTH (axg_params).
++		 */
++		amstaos,proximity-diodes = <1>;
++		amstaos,proximity-led-current-milliamps = <100>;
++		interrupts-extended = <&gpio_intc IRQID_GPIOZ_10 IRQ_TYPE_EDGE_FALLING>;
++		pinctrl-0 = <&spotify_prox_pins>;
++		pinctrl-names = "default";
++	};
++};
++
++/*
++ * MFi I2C bus - Apple authentication coprocessor sits on i2c3 at
++ * an address discovered at runtime. We just expose the bus; no kernel
++ * driver binds, userspace (iAP2 daemon) uses /dev/i2c-3 directly.
++ */
++&i2c3 {
++	status = "okay";
++	pinctrl-0 = <&i2c3_sda_a_pins>, <&i2c3_sck_a_pins>;
++	pinctrl-names = "default";
++	clock-frequency = <400000>;
++};
++
++/*
++ * Audio: TDM-B → on-chip TOACODEC mux → on-chip T9015 analog codec for
++ * line/HP output, plus the PDM block for the 4-mic array. Mirrors the
++ * meson-g12a-u200.dts reference for the AXG audio stack, with only the
++ * frddr/toddr/tdm instances Superbird needs enabled.
++ *
++ * Stock auge_sound also wires GPIOAO_2 as a hardware mute output to an
++ * external amp/mux. We don't drive it from DT - userspace can flip it
++ * via /sys/class/gpio if a future board rev needs it.
++ */
++/*
++ * Audio reset arbitrator must be enabled or every axg-fifo (frddr/toddr)
++ * defers probe waiting for it. Disabled by default in meson-g12.dtsi.
++ */
++&arb {
++	status = "okay";
++};
++
++&clkc_audio {
++	status = "okay";
++};
++
++&toddr_a { status = "okay"; };
++&toddr_b { status = "okay"; };
++
++/*
++ * The Car Thing has no speaker, so the entire TDM-B playback leg
++ * (tdmif_b → tdmout_b → toacodec → on-chip acodec) is dead weight.
++ * tdmif_b's pinctrl-0 also claimed GPIOA_0..GPIOA_3 (mclk0_a /
++ * tdm_b_sclk / tdm_b_fs / tdm_b_dout0) away from the four preset
++ * buttons that share those pads, silencing all four presets at the
++ * kernel input layer. PDM mic capture (GPIOA_7..GPIOA_9) is an
++ * independent path and is the only audio surface we need.
++ */
++&tdmif_b   { status = "disabled"; };
++&tdmout_b  { status = "disabled"; };
++&tdmin_b   { status = "disabled"; };
++&toacodec  { status = "disabled"; };
++&acodec    { status = "disabled"; };
++&frddr_a   { status = "disabled"; };
++&frddr_b   { status = "disabled"; };
++
++&pdm {
++	pinctrl-0 = <&pdm_din0_a_pins>, <&pdm_din1_a_pins>,
++		    <&pdm_dclk_a_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++};
++
++/*
++ * Periphs-bank pinctrl groups for the Spotify-specific button and
++ * scroll-wheel inputs. All inputs have external pull-ups, so we just
++ * tell the SoC to leave the internal bias disabled. mainline
++ * meson-pinctrl doesn't implement PIN_CONFIG_INPUT_ENABLE, so `input-
++ * enable` would only emit pin_config_set warnings - gpiod_get() in the
++ * input drivers handles direction anyway.
++ */
++&periphs_pinctrl {
++	spotify_buttons_pins: spotify-buttons-pins {
++		mux {
++			pins = "GPIOA_0", "GPIOA_1", "GPIOA_2",
++			       "GPIOA_3", "GPIOA_5";
++			bias-disable;
++		};
++	};
++
++	spotify_rotary_pins: spotify-rotary-pins {
++		mux {
++			pins = "GPIOZ_7", "GPIOZ_8", "GPIOZ_9";
++			bias-disable;
++		};
++	};
++
++	/*
++	 * Override mainline meson-g12-common.dtsi's uart_a_pins which sets
++	 * bias-pull-up on uart_a_tx + uart_a_rx. Stock superbird applies
++	 * NO bias on these pins; the pull-up was correlated with the
++	 * BCM20703A2 silently dropping every non-Reset command (only byte
++	 * 2 = 0x0c got a Reset_CC back). uart_a_cts_rts_pins from mainline
++	 * is fine as-is (already bias-disable).
++	 */
++	spotify_uart_a_pins: spotify-uart-a-pins {
++		mux {
++			groups = "uart_a_tx", "uart_a_rx";
++			function = "uart_a";
++			bias-disable;
++		};
++	};
++
++	/*
++	 * TMD2772 INT line. Open-drain on the chip side, so an external
++	 * pull-up holds it high; we just release the SoC bias.
++	 */
++	spotify_prox_pins: spotify-prox-pins {
++		mux {
++			pins = "GPIOZ_10";
++			bias-disable;
++		};
++	};
++
++	/*
++	 * TLSC6x reset (GPIOZ_3, output driven HIGH to release reset)
++	 * and IRQ (GPIOZ_4, input pulled high externally; chip drives
++	 * LOW to assert). Just release the bias - direction is handled
++	 * by the GPIO consumer + gpio_intc IRQ chip respectively.
++	 */
++	spotify_touch_pins: spotify-touch-pins {
++		mux {
++			pins = "GPIOZ_3", "GPIOZ_4";
++			bias-disable;
++		};
++	};
++};
++
++/* CPU DVFS: bind each Cortex-A53 to the VDDCPU PWM regulator so cpufreq-dt
++ * can scale voltage along with frequency across the g12a OPP table. Enable
++ * the pwm_AO_cd controller with the PWM_AO_D pin mux so VDDCPU is actually
++ * driven. */
++&cpu0 { cpu-supply = <&vddcpu>; };
++&cpu1 { cpu-supply = <&vddcpu>; };
++&cpu2 { cpu-supply = <&vddcpu>; };
++&cpu3 { cpu-supply = <&vddcpu>; };
++
++&pwm_AO_cd {
++	pinctrl-0 = <&pwm_ao_d_e_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++};
++
++/* Override clock-latency-ns on every CPU OPP to give the SY8120B1ABC
++ * pwm-regulator enough time to settle on each voltage step. The
++ * inherited meson-g12a.dtsi only sets 50 us on the lowest OPP; that
++ * is tight for the larger jumps (e.g. 861 -> 981 mV at the top of the
++ * table needs ~40 PWM cycles at 1250 ns each = 50 us just for duty
++ * change, plus the LC filter time). 200 us is safely above measured
++ * SY8120 transient response across all observed jump sizes. */
++&cpu_opp_table {
++	opp-1000000000 { clock-latency-ns = <200000>; };
++	opp-1200000000 { clock-latency-ns = <200000>; };
++	opp-1398000000 { clock-latency-ns = <200000>; };
++	opp-1512000000 { clock-latency-ns = <200000>; };
++	opp-1608000000 { clock-latency-ns = <200000>; };
++	opp-1704000000 { clock-latency-ns = <200000>; };
++	opp-1800000000 { clock-latency-ns = <200000>; };
++};
++
++/* `reboot bootloader` / fastboot soft-entry (mainline). syscon-reboot-mode
++ * stashes a magic reboot reason in PREG_STICKY_REG3 (0xff6345cc); u-boot's
++ * carthing_boot_route reads + one-shot-clears it on the next boot and enters
++ * fastboot — no buttons, no maskrom. The reg is a PERIPHS sticky scratch
++ * (survives a warm reset, cold-clears, freely CPU-writable, unlike
++ * AO_SEC_SD_CFG15 which hangs the bus on any AP write). Full writeup:
++ * docs/reboot-bootloader.md in the superbird-uboot repo.
++ *
++ * 0xff6345cc is periphs-bus offset 0x1cc — an unclaimed gap between the
++ * pinctrl gpio reg windows (0x40/0xe8/0x120/0x2c0/0x340), so this dedicated
++ * 4-byte syscon doesn't overlap the pinctrl. Encoding: MAGIC 0x5242a100
++ * ("RB") | REBOOT_REASON (bootloader=7, fastboot=4, recovery=2, maskrom=0x4d). mode-normal=0
++ * clears the magic on a plain reboot so the next boot is a normal A/B boot. */
++&periphs {
++	sticky_reboot: syscon@1cc {
++		compatible = "syscon", "simple-mfd";
++		reg = <0x0 0x1cc 0x0 0x4>;
++
++		reboot-mode {
++			compatible = "syscon-reboot-mode";
++			offset = <0x0>;
++			mask = <0xffffffff>;
++			mode-bootloader = <0x5242a107>;
++			mode-fastboot   = <0x5242a104>;
++			mode-recovery   = <0x5242a102>;
++			mode-maskrom    = <0x5242a14d>;
++			mode-normal     = <0x00000000>;
++		};
++	};
++};

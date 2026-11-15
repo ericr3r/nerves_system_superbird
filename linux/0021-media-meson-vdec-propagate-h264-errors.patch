@@ -1,0 +1,186 @@
+From 23409cff784d35f2d2eae11a2bb282fb354269ba Mon Sep 17 00:00:00 2001
+From: Neel Patel <108803410+68p@users.noreply.github.com>
+Date: Wed, 19 Aug 2026 10:00:00 -0400
+Subject: [PATCH] media: meson: vdec: propagate H.264 picture errors
+
+The Amlogic H.264 firmware marks a damaged decoded picture with bit 9 in
+its frame status. meson-vdec currently logs that bit at debug level and
+then completes the CAPTURE buffer without V4L2_BUF_FLAG_ERROR. Userspace
+therefore treats damaged pictures as valid. In particular,
+GstVideoDecoder's discard-corrupted-frames policy is ineffective and a
+damaged reference picture produces visible corruption in later pictures.
+
+Pass codec status flags through the common completion helper and expose
+firmware-reported H.264 errors as V4L2_BUF_FLAG_ERROR. MPEG-1/2 has no
+equivalent status bit and passes zero.
+
+Also repair timestamp-record aging. The existing loop increments the
+first record *after* the selected offset, while older unmatched records
+are never aged. Those records represent input packets which did not
+produce a picture; retaining them forever leaks timestamp state and keeps
+esparser_queued_bufs artificially high. Age only records older than the
+selected match, retain a 32-picture reordering window, and keep the queue
+counter balanced when an expired record is discarded.
+
+Upstream-Status: Pending
+Signed-off-by: Neel Patel <108803410+68p@users.noreply.github.com>
+---
+ drivers/staging/media/meson/vdec/codec_h264.c   |  7 +++--
+ drivers/staging/media/meson/vdec/codec_mpeg12.c |  2 +-
+ drivers/staging/media/meson/vdec/vdec_helpers.c | 39 ++++++++++++++++---------
+ drivers/staging/media/meson/vdec/vdec_helpers.h |  6 ++--
+ 4 files changed, 36 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_h264.c b/drivers/staging/media/meson/vdec/codec_h264.c
+index 89e0f86..1030b59 100644
+--- a/drivers/staging/media/meson/vdec/codec_h264.c
++++ b/drivers/staging/media/meson/vdec/codec_h264.c
+@@ -393,6 +393,7 @@ static void codec_h264_frames_ready(struct amvdec_session *sess, u32 status)
+ 		u32 pic_struct = (frame_status >> PIC_STRUCT_BIT) &
+ 				 PIC_STRUCT_MASK;
+ 		u32 offset = (frame_status >> OFFSET_BIT) & OFFSET_MASK;
++		u32 vbuf_flags = 0;
+ 		u32 field = V4L2_FIELD_NONE;
+ 
+ 		/*
+@@ -400,9 +401,11 @@ static void codec_h264_frames_ready(struct amvdec_session *sess, u32 status)
+ 		 * but part of the picture will have artifacts.
+ 		 * Typical reason is a temporarily corrupted bitstream
+ 		 */
+-		if (frame_status & ERROR_FLAG)
++		if (frame_status & ERROR_FLAG) {
+ 			dev_dbg(core->dev, "Buffer %d decode error\n",
+ 				buffer_index);
++			vbuf_flags |= V4L2_BUF_FLAG_ERROR;
++		}
+ 
+ 		if (pic_struct == PIC_TOP_BOT)
+ 			field = V4L2_FIELD_INTERLACED_TB;
+@@ -410,7 +413,7 @@ static void codec_h264_frames_ready(struct amvdec_session *sess, u32 status)
+ 			field = V4L2_FIELD_INTERLACED_BT;
+ 
+ 		offset |= get_offset_msb(core, i);
+-		amvdec_dst_buf_done_idx(sess, buffer_index, offset, field);
++		amvdec_dst_buf_done_idx(sess, buffer_index, offset, field, vbuf_flags);
+ 	}
+ }
+ 
+diff --git a/drivers/staging/media/meson/vdec/codec_mpeg12.c b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+index 76e9ca7..0f45eb4 100644
+--- a/drivers/staging/media/meson/vdec/codec_mpeg12.c
++++ b/drivers/staging/media/meson/vdec/codec_mpeg12.c
+@@ -187,7 +187,7 @@ static irqreturn_t codec_mpeg12_threaded_isr(struct amvdec_session *sess)
+ 	codec_mpeg12_update_dar(sess);
+ 	buffer_index = ((reg & 0xf) - 1) & 7;
+ 	offset = amvdec_read_dos(core, MREG_FRAME_OFFSET);
+-	amvdec_dst_buf_done_idx(sess, buffer_index, offset, field);
++	amvdec_dst_buf_done_idx(sess, buffer_index, offset, field, 0);
+ 
+ end:
+ 	amvdec_write_dos(core, MREG_BUFFEROUT, 0);
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.c b/drivers/staging/media/meson/vdec/vdec_helpers.c
+index 90f53fb..806b9a6 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.c
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.c
+@@ -366,7 +366,8 @@ EXPORT_SYMBOL_GPL(amvdec_dst_buf_done);
+ 
+ void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
+ 				struct vb2_v4l2_buffer *vbuf,
+-				u32 offset, u32 field, bool allow_drop)
++				u32 offset, u32 field, bool allow_drop,
++				u32 codec_flags)
+ {
+ 	struct device *dev = sess->core->dev_dec;
+ 	struct amvdec_timestamp *match = NULL;
+@@ -380,19 +381,28 @@ void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
+ 
+ 	/* Look for our vififo offset to get the corresponding timestamp. */
+ 	list_for_each_entry_safe(tmp, n, &sess->timestamps, list) {
+-		if (tmp->offset > offset) {
+-			/*
+-			 * Delete any record that remained unused for 32 match
+-			 * checks
+-			 */
+-			if (tmp->used_count++ >= 32) {
++		if (tmp->offset > offset)
++			break;
++
++		match = tmp;
++	}
++
++	/*
++	 * Packets older than the selected picture may still be reordered
++	 * pictures. Keep a bounded 32-picture window, then discard records
++	 * that repeatedly failed to produce a firmware output.
++	 */
++	if (allow_drop && match) {
++		list_for_each_entry_safe(tmp, n, &sess->timestamps, list) {
++			if (tmp == match)
++				break;
++
++			if (++tmp->used_count >= 32) {
+ 				list_del(&tmp->list);
+ 				kfree(tmp);
++				atomic_dec(&sess->esparser_queued_bufs);
+ 			}
+-			break;
+ 		}
+-
+-		match = tmp;
+ 	}
+ 
+ 	if (!match) {
+@@ -407,14 +417,16 @@ void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
+ 	}
+ 	spin_unlock_irqrestore(&sess->ts_spinlock, flags);
+ 
+-	dst_buf_done(sess, vbuf, field, timestamp, timecode, vbuf_flags);
++	dst_buf_done(sess, vbuf, field, timestamp, timecode,
++		     vbuf_flags | codec_flags);
+ 	if (match)
+ 		atomic_dec(&sess->esparser_queued_bufs);
+ }
+ EXPORT_SYMBOL_GPL(amvdec_dst_buf_done_offset);
+ 
+ void amvdec_dst_buf_done_idx(struct amvdec_session *sess,
+-			     u32 buf_idx, u32 offset, u32 field)
++			     u32 buf_idx, u32 offset, u32 field,
++			     u32 codec_flags)
+ {
+ 	struct vb2_v4l2_buffer *vbuf;
+ 	struct device *dev = sess->core->dev_dec;
+@@ -430,7 +442,8 @@ void amvdec_dst_buf_done_idx(struct amvdec_session *sess,
+ 	}
+ 
+ 	if (offset != -1)
+-		amvdec_dst_buf_done_offset(sess, vbuf, offset, field, true);
++		amvdec_dst_buf_done_offset(sess, vbuf, offset, field, true,
++					   codec_flags);
+ 	else
+ 		amvdec_dst_buf_done(sess, vbuf, field);
+ }
+diff --git a/drivers/staging/media/meson/vdec/vdec_helpers.h b/drivers/staging/media/meson/vdec/vdec_helpers.h
+index 4bf3e61..8be8699 100644
+--- a/drivers/staging/media/meson/vdec/vdec_helpers.h
++++ b/drivers/staging/media/meson/vdec/vdec_helpers.h
+@@ -38,14 +38,16 @@ u32 amvdec_am21c_size(u32 width, u32 height);
+  * @buf_idx: hardware buffer index
+  * @offset: VIFIFO bitstream offset corresponding to the buffer
+  * @field: V4L2 interlaced field
++ * @codec_flags: additional V4L2 buffer flags reported by the codec
+  */
+ void amvdec_dst_buf_done_idx(struct amvdec_session *sess, u32 buf_idx,
+-			     u32 offset, u32 field);
++			     u32 offset, u32 field, u32 codec_flags);
+ void amvdec_dst_buf_done(struct amvdec_session *sess,
+ 			 struct vb2_v4l2_buffer *vbuf, u32 field);
+ void amvdec_dst_buf_done_offset(struct amvdec_session *sess,
+ 				struct vb2_v4l2_buffer *vbuf,
+-				u32 offset, u32 field, bool allow_drop);
++				u32 offset, u32 field, bool allow_drop,
++				u32 codec_flags);
+ 
+ /**
+  * amvdec_add_ts() - Add a timestamp to the list
+-- 
+2.53.0

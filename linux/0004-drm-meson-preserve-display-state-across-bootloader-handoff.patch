@@ -1,0 +1,404 @@
+From a739dde8f5c853f8359bf64845eb91a4adbb7b1a Mon Sep 17 00:00:00 2001
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Mon, 27 Apr 2026 15:21:13 -0400
+Subject: [PATCH] drm/meson: preserve display state across bootloader handoff
+
+When ENCL_VIDEO_EN is already asserted at probe, an earlier boot stage
+has the LCD encoder running against a panel. Re-running the kernel's
+cold-init paths against that live link tears down working state and
+either disturbs the visible image or drops the panel entirely.
+
+Mirror the dw-mipi-dsi 'skip_first_enable' opt-out across the meson
+glue so the kernel adopts the running pipeline instead of rebuilding it:
+
+  meson_drv:
+    - Sample ENCL_VIDEO_EN at bind. Stash the result in a new
+      bootloader_pipeline_up flag on struct meson_drm.
+    - Skip meson_venc_init / meson_vpp_init / meson_viu_init when set;
+      meson_vpu_init runs unconditionally because it only programs VPU
+      arbitration and is harmless on a live pipeline.
+    - Pre-seed venc.current_mode = MIPI_DSI so meson_venc_enable_vsync
+      routes vblank IRQs through the ENCL line-reset source instead of
+      the default ENCI source, which never fires for DSI and would
+      starve page-flip events.
+    - Carve a permanent zeroed framebuffer out of the memory-region
+      reservation that holds the bootloader's splash. The bootloader's
+      own framebuffer occupies the start of the region; we carve at a
+      4 MiB offset, sized for the panel native resolution at XR24, and
+      stash addr/stride/height on struct meson_drm. Used by
+      meson_plane_atomic_disable below.
+
+  meson_dw_mipi_dsi:
+    - Sample DSI_PWR_UP[0] (POWERUP) at probe. Stash on a new
+      bootloader_dsi_up flag.
+    - Skip the probe-time top_rst toggle when set; asserting it
+      propagates the reset through the DWC core into the analog D-PHY
+      and tears down the live link.
+    - Skip phy_init + meson_dw_mipi_dsi_hw_init in host_attach when set;
+      both reset blocks the live link depends on.
+    - Wire mipi_dsi->bootloader_dsi_up to dw_mipi_dsi via the new
+      pdata.skip_first_enable callback so bridge enable / disable cycles
+      become no-ops while the bootloader pipeline is up.
+
+  meson_encoder_dsi:
+    - Skip atomic_enable when bootloader_pipeline_up: bouncing
+      ENCL_VIDEO_EN, reloading gamma, and re-running mode_set would
+      disturb the running encoder.
+    - Skip atomic_disable symmetrically.
+
+  meson_g12a_crtc_atomic_enable:
+    - Skip the VPP/OSD blender re-program when bootloader_pipeline_up.
+      Still call drm_crtc_vblank_on so page-flip events fire on
+      subsequent atomic commits.
+
+  meson_plane_atomic_disable:
+    - Skip clearing OSD1_BLEND_SRC_CTRL / VPP_OSD1_POSTBLEND when
+      bootloader_pipeline_up: OSD1 is the only source feeding the
+      postblend, and clearing it blacks the panel until reboot.
+    - Redirect the OSD canvas to the fallback framebuffer carved at
+      bind time. Skipping the disable alone is not enough: by the time
+      atomic_disable runs the client's CMA framebuffer is on its way
+      back to the page allocator, but the OSD is still scanning its
+      physical address. Reused pages bleed onto the panel as visible
+      corruption. The redirect parks scanout on stable zeroed memory
+      until the next client's first atomic_update points the canvas
+      at its own framebuffer.
+
+The bridge-side skip_first_enable contract is sticky: once skipped,
+every subsequent enable / disable is also skipped. That matches the
+'never touch a running link' invariant this patch establishes for the
+meson side.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+ drivers/gpu/drm/meson/meson_crtc.c        | 13 ++++
+ drivers/gpu/drm/meson/meson_drv.c         | 77 ++++++++++++++++++++++-
+ drivers/gpu/drm/meson/meson_drv.h         | 24 +++++++
+ drivers/gpu/drm/meson/meson_dw_mipi_dsi.c | 47 +++++++++++++-
+ drivers/gpu/drm/meson/meson_encoder_dsi.c | 14 +++++
+ drivers/gpu/drm/meson/meson_plane.c       | 32 ++++++++++
+ 6 files changed, 201 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
+index d70616da8..253686f7d 100644
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -95,6 +95,19 @@ static void meson_g12a_crtc_atomic_enable(struct drm_crtc *crtc,
+ 		return;
+ 	}
+ 
++	/*
++	 * VPP postblend, OSD1 blender scope, and VD1 preblend are already
++	 * configured for the running mode. Re-writing them on the first
++	 * atomic_enable disturbs the OSD → postblend → encoder data path
++	 * and re-enables VD1 preblend the panel hasn't been calibrated for.
++	 * Still arm the vblank IRQ so page-flip events fire on subsequent
++	 * commits.
++	 */
++	if (priv->bootloader_pipeline_up) {
++		drm_crtc_vblank_on(crtc);
++		return;
++	}
++
+ 	/* VD1 Preblend vertical start/end */
+ 	writel(FIELD_PREP(GENMASK(11, 0), 2303),
+ 	       priv->io_base + _REG(VPP_PREBLEND_VD1_V_START_END));
+diff --git a/drivers/gpu/drm/meson/meson_drv.c b/drivers/gpu/drm/meson/meson_drv.c
+index 49ff9f1f1..21eb5da42 100644
+--- a/drivers/gpu/drm/meson/meson_drv.c
++++ b/drivers/gpu/drm/meson/meson_drv.c
+@@ -10,7 +10,9 @@
+ 
+ #include <linux/aperture.h>
+ #include <linux/component.h>
++#include <linux/io.h>
+ #include <linux/module.h>
++#include <linux/of_address.h>
+ #include <linux/of_graph.h>
+ #include <linux/sys_soc.h>
+ #include <linux/platform_device.h>
+@@ -292,10 +294,79 @@ static int meson_drv_bind_master(struct device *dev, bool has_components)
+ 
+ 	/* Hardware Initialization */
+ 
++	/*
++	 * If ENCL_VIDEO_EN is already set, the LCD encoder is mid-frame and
++	 * an earlier boot stage has the display pipeline running against a
++	 * panel. The cold-init paths below (meson_venc_init / meson_vpp_init
++	 * / meson_viu_init) zero ENCL_VIDEO_EN, reset OSD/VPP scalers, and
++	 * disable the OSD blender — all destructive while the link is live.
++	 */
++	priv->bootloader_pipeline_up =
++		!!(readl_relaxed(priv->io_base + _REG(ENCL_VIDEO_EN)) & 0x1);
++	dev_info(dev, "bootloader_pipeline_up=%d (ENCL_VIDEO_EN=0x%x)\n",
++		 priv->bootloader_pipeline_up,
++		 readl_relaxed(priv->io_base + _REG(ENCL_VIDEO_EN)));
++
++	/*
++	 * meson_vpu_init only programs VPU read/write arbitration knobs and
++	 * is safe to run on a live pipeline; it does not touch ENCL or OSD.
++	 */
+ 	meson_vpu_init(priv);
+-	meson_venc_init(priv);
+-	meson_vpp_init(priv);
+-	meson_viu_init(priv);
++
++	if (!priv->bootloader_pipeline_up) {
++		meson_venc_init(priv);
++		meson_vpp_init(priv);
++		meson_viu_init(priv);
++	} else {
++		struct device_node *mem_np;
++		struct resource res;
++
++		/*
++		 * Pre-seed venc.current_mode so meson_venc_enable_vsync()
++		 * routes vblank IRQs through the ENCL line-reset source. The
++		 * default MESON_VENC_MODE_NONE selects ENCI, which never
++		 * fires for a DSI-driven encoder and would starve page-flip
++		 * events on the first atomic commit.
++		 */
++		priv->venc.current_mode = MESON_VENC_MODE_MIPI_DSI;
++
++		/*
++		 * Carve a permanent zeroed framebuffer out of the
++		 * memory-region reservation that holds the bootloader's
++		 * splash. The bootloader's own framebuffer sits at the start
++		 * of the region (~750 KiB at 480x800 RGB565); we carve at a
++		 * 4 MiB offset, sized for the panel native resolution at
++		 * XR24, which is what every userspace client commits with on
++		 * this hardware. atomic_disable redirects scanout here so
++		 * the OSD never reads from CMA pages a DRM client just freed.
++		 */
++		mem_np = of_parse_phandle(dev->of_node, "memory-region", 0);
++		if (mem_np &&
++		    of_address_to_resource(mem_np, 0, &res) == 0 &&
++		    resource_size(&res) >= 0x400000 + 480 * 800 * 4) {
++			size_t size = 480 * 4 * 800;
++			void *fb;
++
++			priv->fallback_fb_addr = res.start + 0x400000;
++			priv->fallback_fb_stride = 480 * 4;
++			priv->fallback_fb_height = 800;
++
++			fb = memremap(priv->fallback_fb_addr, size,
++				      MEMREMAP_WB);
++			if (fb) {
++				memset(fb, 0, size);
++				memunmap(fb);
++			} else {
++				dev_warn(dev,
++					 "fallback fb memremap failed; atomic_disable will leak scanout\n");
++				priv->fallback_fb_addr = 0;
++			}
++		} else {
++			dev_warn(dev,
++				 "no usable memory-region; atomic_disable will leak scanout\n");
++		}
++		of_node_put(mem_np);
++	}
+ 	if (priv->afbcd.ops) {
+ 		ret = priv->afbcd.ops->init(priv);
+ 		if (ret)
+diff --git a/drivers/gpu/drm/meson/meson_drv.h b/drivers/gpu/drm/meson/meson_drv.h
+index be4b0e4df..d0aef4581 100644
+--- a/drivers/gpu/drm/meson/meson_drv.h
++++ b/drivers/gpu/drm/meson/meson_drv.h
+@@ -47,6 +47,30 @@ struct meson_drm {
+ 	struct regmap *hhi;
+ 	int vsync_irq;
+ 
++	/*
++	 * True when ENCL_VIDEO_EN was already asserted at probe — a previous
++	 * boot stage has the LCD encoder running and re-running the kernel's
++	 * cold-init paths (VENC / VPP / VIU init, ENCL_VIDEO_EN bounce, gamma
++	 * reload, OSD blender re-program) would tear that down. Used to gate
++	 * those paths at probe and across the atomic enable / disable cycle.
++	 */
++	bool bootloader_pipeline_up;
++
++	/*
++	 * Permanent zeroed framebuffer carved out of the bootloader's
++	 * reserved-memory region. While bootloader_pipeline_up is true,
++	 * meson_plane_atomic_disable redirects the OSD canvas here so that
++	 * scanout never lands on pages a DRM client has just freed back
++	 * to the allocator. Set up in meson_drv_bind_master after the
++	 * pipeline-up detection; addr is zero on cold boots and on
++	 * bootloader-up boots where memory-region parsing or memremap
++	 * failed (in which case atomic_disable falls back to the
++	 * old early-return behaviour).
++	 */
++	phys_addr_t fallback_fb_addr;
++	unsigned int fallback_fb_stride;
++	unsigned int fallback_fb_height;
++
+ 	struct meson_canvas *canvas;
+ 	u8 canvas_id_osd1;
+ 	u8 canvas_id_vd1_0;
+diff --git a/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c b/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c
+index 66c73c512..10b8f527b 100644
+--- a/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c
++++ b/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c
+@@ -46,8 +46,25 @@ struct meson_dw_mipi_dsi {
+ 	struct clk *bit_clk;
+ 	struct clk *px_clk;
+ 	struct reset_control *top_rst;
++
++	/*
++	 * True when DSI_PWR_UP was already asserted at probe — an earlier
++	 * boot stage has the host in POWERUP and the link is alive against
++	 * the panel. While set, the probe-time TOP reset is skipped, the
++	 * host_attach phy_init / hw_init sequences are skipped, and the
++	 * skip_first_enable callback returns true so the dw-mipi-dsi
++	 * bridge leaves the controller alone across enable transitions.
++	 */
++	bool bootloader_dsi_up;
+ };
+ 
++static bool meson_dw_mipi_dsi_skip_first_enable(void *priv_data)
++{
++	struct meson_dw_mipi_dsi *mipi_dsi = priv_data;
++
++	return mipi_dsi->bootloader_dsi_up;
++}
++
+ #define encoder_to_meson_dw_mipi_dsi(x) \
+ 	container_of(x, struct meson_dw_mipi_dsi, encoder)
+ 
+@@ -238,6 +255,16 @@ static int meson_dw_mipi_dsi_host_attach(void *priv_data,
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * On a bootloader handoff (DSI host already in POWERUP), phy_init
++	 * would call reset_control_reset() on the analog D-PHY register
++	 * block and meson_dw_mipi_dsi_hw_init would issue MIPI_DSI_TOP_SW_RESET
++	 * across the DWC / INTR / DPI / TIMING blocks. Both wipe the live
++	 * link.
++	 */
++	if (mipi_dsi->bootloader_dsi_up)
++		return 0;
++
+ 	ret = phy_init(mipi_dsi->phy);
+ 	if (ret)
+ 		return ret;
+@@ -308,9 +335,22 @@ static int meson_dw_mipi_dsi_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(mipi_dsi->top_rst),
+ 				     "Unable to get reset control\n");
+ 
+-	reset_control_assert(mipi_dsi->top_rst);
+-	usleep_range(10, 20);
+-	reset_control_deassert(mipi_dsi->top_rst);
++	/*
++	 * DSI_PWR_UP[0] (POWERUP) reads as 1 when an earlier boot stage has
++	 * the host running. Asserting top_rst in that state propagates the
++	 * reset through the DWC core into the analog D-PHY and tears down
++	 * the live link. Skip; the host's existing configuration is the
++	 * one we want to keep.
++	 */
++	mipi_dsi->bootloader_dsi_up =
++		!!(readl_relaxed(mipi_dsi->base + 0x04) & 0x1);
++	dev_info(dev, "bootloader_dsi_up=%d\n", mipi_dsi->bootloader_dsi_up);
++
++	if (!mipi_dsi->bootloader_dsi_up) {
++		reset_control_assert(mipi_dsi->top_rst);
++		usleep_range(10, 20);
++		reset_control_deassert(mipi_dsi->top_rst);
++	}
+ 
+ 	/* MIPI DSI Controller */
+ 
+@@ -319,6 +359,7 @@ static int meson_dw_mipi_dsi_probe(struct platform_device *pdev)
+ 	mipi_dsi->pdata.max_data_lanes = 4;
+ 	mipi_dsi->pdata.phy_ops = &meson_dw_mipi_dsi_phy_ops;
+ 	mipi_dsi->pdata.host_ops = &meson_dw_mipi_dsi_host_ops;
++	mipi_dsi->pdata.skip_first_enable = meson_dw_mipi_dsi_skip_first_enable;
+ 	mipi_dsi->pdata.priv_data = mipi_dsi;
+ 	platform_set_drvdata(pdev, mipi_dsi);
+ 
+diff --git a/drivers/gpu/drm/meson/meson_encoder_dsi.c b/drivers/gpu/drm/meson/meson_encoder_dsi.c
+index eba246791..a72b8527f 100644
+--- a/drivers/gpu/drm/meson/meson_encoder_dsi.c
++++ b/drivers/gpu/drm/meson/meson_encoder_dsi.c
+@@ -62,6 +62,14 @@ static void meson_encoder_dsi_atomic_enable(struct drm_bridge *bridge,
+ 	if (WARN_ON(!crtc_state))
+ 		return;
+ 
++	/*
++	 * The encoder is already running at probe-detected timings; bouncing
++	 * ENCL_VIDEO_EN, reloading gamma, and re-running mode_set would all
++	 * disturb the live link.
++	 */
++	if (priv->bootloader_pipeline_up)
++		return;
++
+ 	/* ENCL clock setup is handled by CCF */
+ 
+ 	meson_venc_mipi_dsi_mode_set(priv, &crtc_state->adjusted_mode);
+@@ -85,6 +93,12 @@ static void meson_encoder_dsi_atomic_disable(struct drm_bridge *bridge,
+ 					bridge_to_meson_encoder_dsi(bridge);
+ 	struct meson_drm *priv = meson_encoder_dsi->priv;
+ 
++	/* Symmetric with the skip in atomic_enable: leave the encoder
++	 * running so the link state established at probe is preserved.
++	 */
++	if (priv->bootloader_pipeline_up)
++		return;
++
+ 	writel_relaxed(0, priv->io_base + _REG(ENCL_VIDEO_EN));
+ 
+ 	writel_bits_relaxed(BIT(0), BIT(0), priv->io_base + _REG(VPP_WRAP_OSD1_MATRIX_EN_CTRL));
+diff --git a/drivers/gpu/drm/meson/meson_plane.c b/drivers/gpu/drm/meson/meson_plane.c
+index f8d0e0874..4707599a6 100644
+--- a/drivers/gpu/drm/meson/meson_plane.c
++++ b/drivers/gpu/drm/meson/meson_plane.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/soc/amlogic/meson-canvas.h>
+ 
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+@@ -403,6 +404,37 @@ static void meson_plane_atomic_disable(struct drm_plane *plane,
+ 	struct meson_plane *meson_plane = to_meson_plane(plane);
+ 	struct meson_drm *priv = meson_plane->priv;
+ 
++	/*
++	 * OSD1 is the only source feeding the postblend on this path; clearing
++	 * VIU_OSD1_POSTBLD_SRC_OSD1 (or VPP_OSD1_POSTBLEND on pre-G12A) here
++	 * blacks the panel until reboot. Userspace clients that exit cleanly
++	 * trigger RMFB → atomic_disable, so the plane must keep its OSD path
++	 * alive across those transitions. Leave meson_plane->enabled = true
++	 * so subsequent atomic_update commits flow through.
++	 *
++	 * Skipping the disable alone is not enough: by the time atomic_disable
++	 * runs the client's CMA framebuffer is on its way back to the page
++	 * allocator, but the OSD is still scanning its physical address. The
++	 * pages get reused by the kernel for slab and page-cache, and that
++	 * data bleeds onto the panel as visible corruption (or a black/garbage
++	 * screen on a busy reboot path). Redirect the canvas to the permanent
++	 * zeroed fallback set up at probe so scanout always lands on stable
++	 * memory; the OSD format last programmed by atomic_update is preserved
++	 * (XR24 in practice) and the fallback is sized to match. The next
++	 * client's first atomic_update points the canvas back at its own
++	 * framebuffer.
++	 */
++	if (priv->bootloader_pipeline_up) {
++		if (priv->fallback_fb_addr)
++			meson_canvas_config(priv->canvas, priv->canvas_id_osd1,
++					    priv->fallback_fb_addr,
++					    priv->fallback_fb_stride,
++					    priv->fallback_fb_height,
++					    MESON_CANVAS_WRAP_NONE,
++					    MESON_CANVAS_BLKMODE_LINEAR, 0);
++		return;
++	}
++
+ 	if (priv->afbcd.ops) {
+ 		priv->afbcd.ops->reset(priv);
+ 		priv->afbcd.ops->disable(priv);
+-- 
+2.54.0
+

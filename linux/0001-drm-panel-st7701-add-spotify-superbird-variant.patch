@@ -1,0 +1,365 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Subject: [PATCH] drm/panel: st7701: add Spotify Car Thing (Superbird) variant
+
+Adds a variant for the ST7701S panel on the Spotify Car Thing
+("Superbird"). Compatible: spotify,superbird-panel.
+
+Five structural additions to the driver:
+
+  1. .init_sequence - fully replaces the generic st7701 init. Only
+     used as a fallback for cold boots where the bootloader didn't
+     bring the panel up. Replays Spotify u-boot's
+     mipi_init_on_table[] byte-for-byte.
+
+  2. .clock_continuous - drops MIPI_DSI_CLOCK_NON_CONTINUOUS for
+     panels whose GIP timing requires a continuous HS byteclock.
+
+  3. .bootloader_initialized - when true, ALL FOUR panel ops
+     (prepare, unprepare, enable, disable) become true no-ops.
+     Sending any DCS command, GPIO toggle, or regulator transition
+     during the kernel's view of the panel lifecycle disturbs the
+     Superbird ST7701S in ways the kernel cannot recover from
+     (wrap in both directions, displaced dotted lines, alternating
+     stripes - symptoms of a fundamental encoder/PLL/sync mismatch
+     that no byte-level retuning fixes).
+
+     The flag is intended for hand-off scenarios where the encoder,
+     DSI host, and panel were all programmed by an earlier boot stage
+     and the kernel's job is to adopt that state, not rebuild it.
+     Display sleep on this device is driven by backlight / OSD blank,
+     NOT by panel sleep mode. Suspend/resume is not supported.
+
+  4. Reset GPIO acquisition is GPIOD_ASIS when bootloader_initialized
+     is set, instead of GPIOD_OUT_LOW. The default mainline path
+     immediately drives the reset line low at devm_gpiod_get(), which
+     resets panel hardware, wipes the bootloader's GIP / gamma / VCOM
+     init, and leaves the panel in a state the bootloader_initialized
+     no-op path cannot recover from.
+
+  5. superbird_init_sequence (u-boot byte replay, used only if
+     init falls through to a cold path), superbird_mode,
+     superbird_desc with the above flags set.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+diff --git a/drivers/gpu/drm/panel/panel-sitronix-st7701.c b/drivers/gpu/drm/panel/panel-sitronix-st7701.c
+index 2f79ec4a2..d069b153f 100644
+--- a/drivers/gpu/drm/panel/panel-sitronix-st7701.c
++++ b/drivers/gpu/drm/panel/panel-sitronix-st7701.c
+@@ -127,6 +127,36 @@ struct st7701_panel_desc {
+
+ 	/* GIP sequence, fully custom and undocumented. */
+ 	void		(*gip_sequence)(struct st7701 *st7701);
++
++	/*
++	 * Optional: replace the generic init sequence entirely. When set,
++	 * st7701_init_sequence() is NOT called; this callback is expected
++	 * to take the panel from reset-released to "ready for DISPON".
++	 * gip_sequence still runs afterwards if also set.
++	 */
++	void		(*init_sequence)(struct st7701 *st7701);
++
++	/*
++	 * Optional: when true, drive the DSI clock continuously in HS mode
++	 * instead of dropping to LP between transmissions. Required by
++	 * some panels (e.g., Spotify Superbird) whose GIP timing depends
++	 * on an always-HS byteclock. Default false keeps MIPI_DSI_CLOCK_
++	 * NON_CONTINUOUS for all other variants.
++	 */
++	bool		clock_continuous;
++
++	/*
++	 * Optional: when true, skip the first prepare() and unprepare() cycle
++	 * after probe. The bootloader (e.g. Spotify u-boot for Superbird) has
++	 * already initialized the panel into a working display state, and
++	 * re-running our init sequence over that state ends up with subtly
++	 * different panel internal config - manifesting as alternating R/B
++	 * rows on solid red, dotted lines at column 0, and other artifacts
++	 * that no register-level matching can fix. Skipping the first prepare
++	 * preserves the bootloader's state for as long as the kernel doesn't
++	 * voluntarily suspend the panel.
++	 */
++	bool		bootloader_initialized;
+ };
+
+ struct st7701 {
+@@ -547,6 +577,17 @@ static int st7701_prepare(struct drm_panel *panel)
+ 	struct st7701 *st7701 = panel_to_st7701(panel);
+ 	int ret;
+
++	/* Bootloader-initialized: never touch the panel from kernel. Pulsing
++	 * reset and re-running our init puts the panel into a different
++	 * internal state than what u-boot established (subtle differences in
++	 * gamma, VCOM, GIP timing, COLMOD) - manifesting as alternating R/B
++	 * rows on solid red, dotted lines, stair-step boundaries. The
++	 * bootloader's setup is what we want to preserve for the life of the
++	 * kernel; all panel mode transitions are no-ops.
++	 */
++	if (st7701->desc->bootloader_initialized)
++		return 0;
++
+ 	gpiod_set_value(st7701->reset, 0);
+
+ 	ret = regulator_bulk_enable(ARRAY_SIZE(st7701->supplies),
+@@ -558,7 +599,10 @@ static int st7701_prepare(struct drm_panel *panel)
+ 	gpiod_set_value(st7701->reset, 1);
+ 	msleep(150);
+
+-	st7701_init_sequence(st7701);
++	if (st7701->desc->init_sequence)
++		st7701->desc->init_sequence(st7701);
++	else
++		st7701_init_sequence(st7701);
+
+ 	if (st7701->desc->gip_sequence)
+ 		st7701->desc->gip_sequence(st7701);
+@@ -573,6 +617,17 @@ static int st7701_enable(struct drm_panel *panel)
+ {
+ 	struct st7701 *st7701 = panel_to_st7701(panel);
+
++	/* Bootloader-initialized panels: send absolutely nothing. Even
++	 * "harmless" DCS like SLPOUT/DISPON-while-already-on disturbs the
++	 * Spotify Superbird ST7701S - produces wrap-in-both-directions,
++	 * displaced dotted lines, alternating stripes. The panel is already
++	 * out of sleep and on; the bridge skip-first-enable keeps the host
++	 * link untouched, so a no-op here just leaves the running pipeline
++	 * alone.
++	 */
++	if (st7701->desc->bootloader_initialized)
++		return 0;
++
+ 	ST7701_WRITE(st7701, MIPI_DCS_SET_DISPLAY_ON, 0x00);
+
+ 	return 0;
+@@ -582,6 +637,15 @@ static int st7701_disable(struct drm_panel *panel)
+ {
+ 	struct st7701 *st7701 = panel_to_st7701(panel);
+
++	/* Bootloader-initialized: same rule as enable(). Sending DISPOFF or
++	 * SLPIN cycles the panel through state transitions it doesn't seem
++	 * to recover from cleanly. Display sleep on this device is driven
++	 * via backlight 0% / OSD blank, NOT via the panel's sleep state.
++	 * Suspend/resume is not supported.
++	 */
++	if (st7701->desc->bootloader_initialized)
++		return 0;
++
+ 	ST7701_WRITE(st7701, MIPI_DCS_SET_DISPLAY_OFF, 0x00);
+
+ 	return 0;
+@@ -591,6 +655,9 @@ static int st7701_unprepare(struct drm_panel *panel)
+ {
+ 	struct st7701 *st7701 = panel_to_st7701(panel);
+
++	if (st7701->desc->bootloader_initialized)
++		return 0;
++
+ 	ST7701_WRITE(st7701, MIPI_DCS_ENTER_SLEEP_MODE, 0x00);
+
+ 	msleep(st7701->sleep_delay);
+@@ -1258,6 +1325,168 @@ static const struct st7701_panel_desc wf40eswaa6mnn0_desc = {
+ 	.gip_sequence = wf40eswaa6mnn0_gip_sequence,
+ };
+
++/*
++ * Spotify Car Thing (Superbird) ST7701S init sequence.
++ *
++ * Replays Spotify's u-boot driver
++ * (superbird-uboot/drivers/display/lcd/lcd_extern/mipi_ST7701.c)
++ * mipi_init_on_table[] byte-for-byte. The kernel-side mipi_ST7701.c in
++ * the Spotify GPL release uses different bytes than u-boot - but stock
++ * kernel inherits u-boot's panel state without re-initializing, so the
++ * proven-working bytes are the u-boot ones, not the kernel ones.
++ *
++ * Notable shape differences from kernel-stock init:
++ *  - No initial SLPOUT or BK3 kick dance (panel comes out of HW reset
++ *    in a state where BK3 selection works directly).
++ *  - INVSEL = 0x01 0x07 (kernel uses 0x07 0x02).
++ *  - CC = 0x10 (kernel uses 0x38).
++ *  - Gamma curves are completely different.
++ *  - BK1 0xB1 (VCOM) = 0x45, B2 (VGH) = 0x82 (kernel: 0x38, 0x84).
++ *  - BK1 0xC0 not written.
++ *  - GIP ladder CKV phase E5/E8 byte 3-4,7-8 = 0x9A 0xA0
++ *    (kernel uses 0xAF 0xB3).
++ *  - EF last byte = 0x45 (kernel uses 0x4B).
++ *  - SLPOUT issued at the END (after GIP setup and BK3 kicks), not start.
++ *  - No COLMOD/SET_PIXEL_FORMAT write at all.
++ *  - DISPON at the end (panel framework's enable() also does this - net
++ *    effect is two DISPONs which is harmless).
++ */
++static void superbird_init_sequence(struct st7701 *st7701)
++{
++	/* BK3 - vendor lock-clear before any other config. */
++	st7701_switch_cmd_bkx(st7701, true, 3);
++	ST7701_WRITE(st7701, 0xEF, 0x08);
++
++	/* BK0 - LNESET, PORCTRL, INVSEL, CC, gammas. */
++	st7701_switch_cmd_bkx(st7701, true, 0);
++	ST7701_WRITE(st7701, 0xC0, 0x63, 0x00);
++	ST7701_WRITE(st7701, 0xC1, 0x0A, 0x02);
++	ST7701_WRITE(st7701, 0xC2, 0x01, 0x07);
++	ST7701_WRITE(st7701, 0xCC, 0x10);
++	ST7701_WRITE(st7701, 0xB0,
++		   0x0A, 0x10, 0x96, 0x0E, 0x11, 0x06, 0x06, 0x0A,
++		   0x08, 0x24, 0x07, 0x53, 0x11, 0x68, 0xAD, 0xD1);
++	ST7701_WRITE(st7701, 0xB1,
++		   0x06, 0x8D, 0xD3, 0x09, 0x0D, 0x04, 0x04, 0x07,
++		   0x07, 0x23, 0x05, 0x15, 0x14, 0xA7, 0xAC, 0x4F);
++
++	/* BK1 - power registers. */
++	st7701_switch_cmd_bkx(st7701, true, 1);
++	ST7701_WRITE(st7701, 0xB0, 0x5D);
++	ST7701_WRITE(st7701, 0xB1, 0x45);
++	ST7701_WRITE(st7701, 0xB2, 0x82);
++	ST7701_WRITE(st7701, 0xB3, 0x80);
++	ST7701_WRITE(st7701, 0xB5, 0x45);
++	ST7701_WRITE(st7701, 0xB7, 0x85);
++	ST7701_WRITE(st7701, 0xB8, 0x21);
++	ST7701_WRITE(st7701, 0xB9, 0x10, 0x1F);
++	ST7701_WRITE(st7701, 0xBB, 0x03);
++	ST7701_WRITE(st7701, 0xBC, 0x3E);
++	ST7701_WRITE(st7701, 0xC1, 0x78);
++	ST7701_WRITE(st7701, 0xC2, 0x78);
++	ST7701_WRITE(st7701, 0xD0, 0x88);
++
++	msleep(8);
++
++	/* BK1 GIP ladder - u-boot byte values exactly. */
++	ST7701_WRITE(st7701, 0xE0, 0x00, 0x00, 0x02);
++	ST7701_WRITE(st7701, 0xE1,
++		   0x04, 0x00, 0x00, 0x00,
++		   0x05, 0x00, 0x00, 0x00,
++		   0x00, 0x20, 0x20);
++	ST7701_WRITE(st7701, 0xE2,
++		   0x00, 0x00, 0x00, 0x00,
++		   0x00, 0x00, 0x00, 0x00,
++		   0x00, 0x00, 0x00, 0x00);
++	ST7701_WRITE(st7701, 0xE3, 0x00, 0x00, 0x33, 0x00);
++	ST7701_WRITE(st7701, 0xE4, 0x22, 0x00);
++	ST7701_WRITE(st7701, 0xE5,
++		   0x04, 0x34, 0x9A, 0xA0,
++		   0x06, 0x34, 0x9A, 0xA0,
++		   0x00, 0x00, 0x00, 0x00,
++		   0x00, 0x00, 0x00, 0x00);
++	ST7701_WRITE(st7701, 0xE6, 0x00, 0x00, 0x33, 0x00);
++	ST7701_WRITE(st7701, 0xE7, 0x22, 0x00);
++	ST7701_WRITE(st7701, 0xE8,
++		   0x05, 0x34, 0x9A, 0xA0,
++		   0x07, 0x34, 0x9A, 0xA0,
++		   0x00, 0x00, 0x00, 0x00,
++		   0x00, 0x00, 0x00, 0x00);
++	ST7701_WRITE(st7701, 0xEB,
++		   0x02, 0x00, 0x40, 0x40,
++		   0x00, 0x00, 0x00);
++	ST7701_WRITE(st7701, 0xEC, 0x00, 0x00);
++	ST7701_WRITE(st7701, 0xED,
++		   0xFA, 0x45, 0x0B, 0xFF,
++		   0xFF, 0xFF, 0xFF, 0xFF,
++		   0xFF, 0xFF, 0xFF, 0xFF,
++		   0xFF, 0xB0, 0x54, 0xAF);
++	ST7701_WRITE(st7701, 0xEF, 0x08, 0x08, 0x08, 0x45, 0x3F, 0x54);
++
++	/* BK3 kick. */
++	st7701_switch_cmd_bkx(st7701, true, 3);
++	ST7701_WRITE(st7701, 0xE8, 0x00, 0x0E);
++
++	/* CMD1: SLPOUT (issued AFTER GIP setup, not before). */
++	st7701_switch_cmd_bkx(st7701, false, 0);
++	ST7701_WRITE(st7701, MIPI_DCS_EXIT_SLEEP_MODE, 0x00);
++	msleep(120);
++
++	/* BK3: second kick. */
++	st7701_switch_cmd_bkx(st7701, true, 3);
++	ST7701_WRITE(st7701, 0xE8, 0x00, 0x0C);
++	msleep(2);
++	ST7701_WRITE(st7701, 0xE8, 0x00, 0x00);
++
++	/* CMD1: TEAR_ON. (No COLMOD - u-boot doesn't write 0x3A; panel
++	 * comes out of reset with a default pixel format that works.)
++	 */
++	st7701_switch_cmd_bkx(st7701, false, 0);
++	ST7701_WRITE(st7701, MIPI_DCS_SET_TEAR_ON, 0x00);
++}
++
++static const struct drm_display_mode superbird_mode = {
++	.clock		= 27918,
++
++	.hdisplay	= 480,
++	.hsync_start	= 480 + 30,
++	.hsync_end	= 480 + 30 + 10,
++	.htotal		= 480 + 30 + 10 + 30,
++
++	.vdisplay	= 800,
++	.vsync_start	= 800 + 20,
++	.vsync_end	= 800 + 20 + 6,
++	.vtotal		= 800 + 20 + 6 + 20,
++
++	.width_mm	= 52,
++	.height_mm	= 86,
++
++	.flags		= DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC,
++
++	.type		= DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
++};
++
++static const struct st7701_panel_desc superbird_desc = {
++	.mode = &superbird_mode,
++	.lanes = 2,
++	.format = MIPI_DSI_FMT_RGB888,
++	.panel_sleep_delay = 0,
++
++	.init_sequence = superbird_init_sequence,
++
++	/* Stock Amlogic DTS sets clk_always_hs=1 for this panel - its GIP
++	 * state machine expects a continuous byte-clock in HS mode.
++	 */
++	.clock_continuous = true,
++
++	/* Spotify u-boot fully initializes the panel before kernel takes
++	 * over. Stock kernel inherits that state without re-initing -
++	 * doing so produces visible artifacts. We follow the same approach
++	 * and treat all panel mode transitions as no-ops.
++	 */
++	.bootloader_initialized = true,
++};
++
+ static void st7701_cleanup(void *data)
+ {
+ 	struct st7701 *st7701 = (struct st7701 *)data;
+@@ -1290,7 +1519,15 @@ static int st7701_probe(struct device *dev, int connector_type)
+ 	if (ret < 0)
+ 		return ret;
+
+-	st7701->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++	/* For bootloader-initialized panels, the bootloader has already
++	 * released the reset line and run the panel init sequence. Driving
++	 * the reset line low here would reset the panel hardware and we'd
++	 * never recover its init state without a re-init we can't reproduce.
++	 * Request as GPIOD_ASIS to leave the line at whatever the bootloader
++	 * left it (released, panel running). */
++	st7701->reset = devm_gpiod_get(dev, "reset",
++				       desc->bootloader_initialized
++					       ? GPIOD_ASIS : GPIOD_OUT_LOW);
+ 	if (IS_ERR(st7701->reset)) {
+ 		dev_err(dev, "Couldn't get our reset GPIO\n");
+ 		return PTR_ERR(st7701->reset);
+@@ -1342,7 +1579,9 @@ static int st7701_dsi_probe(struct mipi_dsi_device *dsi)
+ 		return dev_err_probe(&dsi->dev, -EINVAL, "This panel is not for MIPI DSI\n");
+
+ 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
+-			  MIPI_DSI_MODE_LPM | MIPI_DSI_CLOCK_NON_CONTINUOUS;
++			  MIPI_DSI_MODE_LPM;
++	if (!st7701->desc->clock_continuous)
++		dsi->mode_flags |= MIPI_DSI_CLOCK_NON_CONTINUOUS;
+ 	dsi->format = st7701->desc->format;
+ 	dsi->lanes = st7701->desc->lanes;
+
+@@ -1387,6 +1626,7 @@ static const struct of_device_id st7701_dsi_of_match[] = {
+ 	{ .compatible = "anbernic,rg-arc-panel", .data = &rg_arc_desc },
+ 	{ .compatible = "densitron,dmt028vghmcmi-1a", .data = &dmt028vghmcmi_1a_desc },
+ 	{ .compatible = "elida,kd50t048a", .data = &kd50t048a_desc },
++	{ .compatible = "spotify,superbird-panel", .data = &superbird_desc },
+ 	{ .compatible = "techstar,ts8550b", .data = &ts8550b_desc },
+ 	{ .compatible = "winstar,wf40eswaa6mnn0", .data = &wf40eswaa6mnn0_desc },
+ 	{ }

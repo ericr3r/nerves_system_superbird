@@ -1,0 +1,71 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Sat, 25 Apr 2026 04:00:00 +0000
+Subject: [PATCH] Input: rotary-encoder - fall back to fwnode_irq_get when
+ gpiod_to_irq fails
+
+Some gpiochips (e.g. Amlogic Meson) don't implement the `.to_irq`
+callback, so gpiod_to_irq() returns -ENXIO for every GPIO and the
+rotary-encoder driver fails probe with "unable to request IRQ -6".
+
+Fall back to fwnode_irq_get(dev_fwnode(dev), i) when gpiod_to_irq
+fails so boards can wire IRQs explicitly via "interrupts" or
+"interrupts-extended" - entries in those properties are matched
+positionally against the entries in "gpios".
+
+When the IRQ comes from DT, drop the IRQF_TRIGGER_RISING/FALLING
+flags from request_threaded_irq - the trigger type is already set
+on the IRQ via the DT cells, and forcing EDGE_BOTH overrides it.
+That override fails on IRQ controllers that don't support edge-both
+(e.g. Amlogic G12A gpio_intc returns -EINVAL from .irq_set_type).
+
+The check is done via a signed local because struct rotary_encoder.irq
+is `unsigned int *`; comparing `encoder->irq[i] < 0` would silently fold
+to false on the unsigned cast and miss the gpiod_to_irq error.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+diff --git a/drivers/input/misc/rotary_encoder.c b/drivers/input/misc/rotary_encoder.c
+index f706e1997..7ab01c208 100644
+--- a/drivers/input/misc/rotary_encoder.c
++++ b/drivers/input/misc/rotary_encoder.c
+@@ -277,12 +277,35 @@ static int rotary_encoder_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+
+ 	for (i = 0; i < encoder->gpios->ndescs; ++i) {
+-		encoder->irq[i] = gpiod_to_irq(encoder->gpios->desc[i]);
++		unsigned long irqflags = IRQF_ONESHOT;
++		int irq = gpiod_to_irq(encoder->gpios->desc[i]);
++
++		if (irq < 0) {
++			/*
++			 * Some gpiochips (e.g. Amlogic Meson) don't implement
++			 * .to_irq, so gpiod_to_irq() returns -ENXIO. Allow
++			 * boards to wire IRQs explicitly via the device's
++			 * "interrupts"/"interrupts-extended" properties; the
++			 * indices match the order of "gpios". When the IRQ
++			 * came from DT, trust the trigger type already set
++			 * via the interrupts cells - forcing EDGE_BOTH here
++			 * would override that and fails on IRQ controllers
++			 * that don't support edge-both (e.g. Amlogic G12A).
++			 */
++			irq = fwnode_irq_get(dev_fwnode(dev), i);
++			if (irq < 0) {
++				dev_err(dev, "no IRQ available for gpio#%d\n",
++					i);
++				return irq;
++			}
++		} else {
++			irqflags |= IRQF_TRIGGER_RISING |
++				    IRQF_TRIGGER_FALLING;
++		}
++		encoder->irq[i] = irq;
+
+ 		err = devm_request_threaded_irq(dev, encoder->irq[i],
+-				NULL, handler,
+-				IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
+-				IRQF_ONESHOT,
++				NULL, handler, irqflags,
+ 				DRV_NAME, encoder);
+ 		if (err) {
+ 			dev_err(dev, "unable to request IRQ %d (gpio#%d)\n",

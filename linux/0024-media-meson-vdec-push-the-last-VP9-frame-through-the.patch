@@ -1,0 +1,205 @@
+From 5cac054773201129c0a51daa8eecb4bde1968cae Mon Sep 17 00:00:00 2001
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 15:30:00 -0400
+Subject: [PATCH] media: meson: vdec: push the last VP9 frame through the
+ stream fetcher
+
+On V4L2_DEC_CMD_STOP the VP9 path waits until the decoder has raised no
+interrupt for 50ms, then flushes the frames it still holds. The final
+frame of a stream is only output by that flush, so it must have been
+parsed by then.
+
+It often is not. The HEVC stream fetcher stops short of the end of the
+VIFIFO when nothing follows the last frame: on a 1280x720 clip,
+HEVC_STREAM_RD_PTR stalls 3.5 to 5 KiB behind the write pointer with
+the last frame's bytes still unread, indefinitely. The flush then only
+outputs the previous frame, the final timestamp is never retired, and
+the client waits forever for the buffer flagged V4L2_BUF_FLAG_LAST.
+A looping <video> in Chromium freezes on its last frame whenever this hits.
+
+Give VP9 an end-of-stream sequence of ESPARSER_MIN_PACKET_SIZE zero
+bytes, the same padding the ESPARSER already places between short
+frames, and queue it before draining. The fetcher then consumes the
+last frame and stops inside the padding, and decoding resumes normally
+when more input follows. esparser_queue_eos() now appends the search
+start code itself, which a payload without one needs to complete the
+parser write, and takes the session so it can record the write.
+
+Count ESPARSER writes as decoder activity in vdec_wait_inactive(). The
+decoder can sit idle well over 50ms while it waits for input, so input
+written just before a drain must restart the quiet period, or the
+flush runs before the decoder has seen that input.
+
+Upstream-Status: Pending
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+---
+ drivers/staging/media/meson/vdec/codec_vp9.c | 11 +++++++++++
+ drivers/staging/media/meson/vdec/esparser.c  |  9 +++++++--
+ drivers/staging/media/meson/vdec/esparser.h  |  4 ++--
+ drivers/staging/media/meson/vdec/vdec.c      | 18 +++++++++---------
+ drivers/staging/media/meson/vdec/vdec.h      |  4 ++--
+ 5 files changed, 31 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_vp9.c b/drivers/staging/media/meson/vdec/codec_vp9.c
+index 8a83b7fc2..257b86b20 100644
+--- a/drivers/staging/media/meson/vdec/codec_vp9.c
++++ b/drivers/staging/media/meson/vdec/codec_vp9.c
+@@ -12,6 +12,7 @@
+ #include "codec_vp9.h"
+ #include "vdec_helpers.h"
+ #include "codec_hevc_common.h"
++#include "esparser.h"
+ 
+ /* HEVC reg mapping */
+ #define VP9_DEC_STATUS_REG	HEVC_ASSIST_SCRATCH_0
+@@ -684,6 +685,15 @@ static void codec_vp9_flush_output(struct amvdec_session *sess)
+ 	mutex_unlock(&vp9->lock);
+ }
+ 
++/* the stream fetcher only hands the last frame to the decoder once more input follows it */
++static const u8 codec_vp9_eos_padding[ESPARSER_MIN_PACKET_SIZE];
++
++static const u8 *codec_vp9_eos_sequence(u32 *len)
++{
++	*len = sizeof(codec_vp9_eos_padding);
++	return codec_vp9_eos_padding;
++}
++
+ static u32 codec_vp9_num_pending_bufs(struct amvdec_session *sess)
+ {
+ 	struct codec_vp9 *vp9 = sess->priv;
+@@ -2165,5 +2175,6 @@ struct amvdec_codec_ops codec_vp9_ops = {
+ 	.threaded_isr = codec_vp9_threaded_isr,
+ 	.num_pending_bufs = codec_vp9_num_pending_bufs,
+ 	.drain = codec_vp9_flush_output,
++	.eos_sequence = codec_vp9_eos_sequence,
+ 	.resume = codec_vp9_resume,
+ };
+diff --git a/drivers/staging/media/meson/vdec/esparser.c b/drivers/staging/media/meson/vdec/esparser.c
+index 4632346f0..793cbfd34 100644
+--- a/drivers/staging/media/meson/vdec/esparser.c
++++ b/drivers/staging/media/meson/vdec/esparser.c
+@@ -252,10 +252,12 @@ static u32 esparser_vififo_get_free_space(struct amvdec_session *sess)
+ 	return sess->vififo_size - vififo_usage;
+ }
+ 
+-int esparser_queue_eos(struct amvdec_core *core, const u8 *data, u32 len)
++int esparser_queue_eos(struct amvdec_session *sess, const u8 *data, u32 len)
+ {
++	static const u8 start_code[] = { 0x00, 0x00, 0x01, 0xff };
++	struct amvdec_core *core = sess->core;
+ 	struct device *dev = core->dev;
+-	void *eos_vaddr;
++	u8 *eos_vaddr;
+ 	dma_addr_t eos_paddr;
+ 	int ret;
+ 
+@@ -265,7 +267,9 @@ int esparser_queue_eos(struct amvdec_core *core, const u8 *data, u32 len)
+ 		return -ENOMEM;
+ 
+ 	memcpy(eos_vaddr, data, len);
++	memcpy(eos_vaddr + len, start_code, sizeof(start_code));
+ 	ret = esparser_write_data(core, eos_paddr, len);
++	sess->last_activity_jiffies = get_jiffies_64();
+ 	dma_free_coherent(dev, len + SEARCH_PATTERN_LEN,
+ 			  eos_vaddr, eos_paddr);
+ 
+@@ -353,6 +357,7 @@ esparser_queue(struct amvdec_session *sess, struct vb2_v4l2_buffer *vbuf)
+ 
+ 	pad_size = esparser_pad_start_code(core, vb, payload_size);
+ 	ret = esparser_write_data(core, phy, payload_size + pad_size);
++	sess->last_activity_jiffies = get_jiffies_64();
+ 
+ 	if (ret <= 0) {
+ 		dev_warn(core->dev, "esparser: input parsing error\n");
+diff --git a/drivers/staging/media/meson/vdec/esparser.h b/drivers/staging/media/meson/vdec/esparser.h
+index 9351e62c7..07e9f161e 100644
+--- a/drivers/staging/media/meson/vdec/esparser.h
++++ b/drivers/staging/media/meson/vdec/esparser.h
+@@ -17,11 +17,11 @@ int esparser_power_up(struct amvdec_session *sess);
+ /**
+  * esparser_queue_eos() - write End Of Stream sequence to the ESPARSER
+  *
+- * @core: vdec core struct
++ * @sess: current session
+  * @data: EOS sequence
+  * @len: length of EOS sequence
+  */
+-int esparser_queue_eos(struct amvdec_core *core, const u8 *data, u32 len);
++int esparser_queue_eos(struct amvdec_session *sess, const u8 *data, u32 len);
+ 
+ /**
+  * esparser_queue_all_src() - work handler that writes as many src buffers
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 71c4b97d2..a2bdc9f11 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -113,8 +113,8 @@ static int vdec_poweron(struct amvdec_session *sess)
+ 
+ static void vdec_wait_inactive(struct amvdec_session *sess)
+ {
+-	/* We consider 50ms with no IRQ to be inactive. */
+-	while (time_is_after_jiffies64(sess->last_irq_jiffies +
++	/* We consider 50ms with no IRQ and no new input to be inactive. */
++	while (time_is_after_jiffies64(sess->last_activity_jiffies +
+ 				       msecs_to_jiffies(50)))
+ 		msleep(25);
+ }
+@@ -768,17 +768,17 @@ vdec_decoder_cmd(struct file *file, void *fh, struct v4l2_decoder_cmd *cmd)
+ 
+ 	v4l2_m2m_mark_stopped(sess->m2m_ctx);
+ 
+-	if (codec_ops->drain) {
+-		vdec_wait_inactive(sess);
+-		codec_ops->drain(sess);
+-	} else if (codec_ops->eos_sequence) {
++	if (codec_ops->eos_sequence) {
+ 		u32 len;
+ 		const u8 *data = codec_ops->eos_sequence(&len);
+ 
+-		esparser_queue_eos(sess->core, data, len);
+-		vdec_wait_inactive(sess);
++		esparser_queue_eos(sess, data, len);
+ 	}
+ 
++	vdec_wait_inactive(sess);
++	if (codec_ops->drain)
++		codec_ops->drain(sess);
++
+ 	return ret;
+ }
+ 
+@@ -1036,7 +1036,7 @@ static irqreturn_t vdec_isr(int irq, void *data)
+ 	struct amvdec_core *core = data;
+ 	struct amvdec_session *sess = core->cur_sess;
+ 
+-	sess->last_irq_jiffies = get_jiffies_64();
++	sess->last_activity_jiffies = get_jiffies_64();
+ 
+ 	return sess->fmt_out->codec_ops->isr(sess);
+ }
+diff --git a/drivers/staging/media/meson/vdec/vdec.h b/drivers/staging/media/meson/vdec/vdec.h
+index f1aec1f7d..b22f169f8 100644
+--- a/drivers/staging/media/meson/vdec/vdec.h
++++ b/drivers/staging/media/meson/vdec/vdec.h
+@@ -219,7 +219,7 @@ enum amvdec_status {
+  * @recycle_thread: task struct for the recycling thread
+  * @timestamps: chronological list of src timestamps
+  * @ts_spinlock: spinlock for the timestamps list
+- * @last_irq_jiffies: tracks last time the vdec triggered an IRQ
++ * @last_activity_jiffies: tracks the last vdec IRQ or ESPARSER write
+  * @last_offset: tracks last offset of vififo
+  * @wrap_count: number of times the vififo wrapped around
+  * @fw_idx_to_vb2_idx: firmware buffer index to vb2 buffer index
+@@ -273,7 +273,7 @@ struct amvdec_session {
+ 	struct list_head timestamps;
+ 	spinlock_t ts_spinlock; /* timestamp list lock */
+ 
+-	u64 last_irq_jiffies;
++	u64 last_activity_jiffies;
+ 	u32 last_offset;
+ 	u32 wrap_count;
+ 	u32 fw_idx_to_vb2_idx[32];
+-- 
+2.53.0
+

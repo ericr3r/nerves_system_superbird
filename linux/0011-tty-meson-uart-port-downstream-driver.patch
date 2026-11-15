@@ -1,0 +1,480 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Subject: [PATCH] tty: meson-uart: align driver with Amlogic stock 4.9 for BCM20703A2
+
+Replace mainline meson_uart.c semantics with Amlogic's downstream stock
+4.9 driver semantics (drivers/amlogic/uart/meson_uart.c), adapted for
+v6.19 APIs. All of these match the proven-working BCM20703A2 BT
+bringup path on the Spotify Car Thing (S905D2 / G12A):
+
+  - meson_uart_port wrapper struct with a separate wr_lock spinlock for
+    TX FIFO writes.
+  - meson_uart_start_tx (uart-write side) and meson_transmit_chars
+    (IRQ side) are split, both drain the kfifo under wr_lock; only
+    transmit_chars handles x_char.
+  - IRQ handler reads CONTROL with port->lock briefly held, releases
+    the lock, and dispatches to receive/transmit which re-take their
+    own locks.
+  - meson_uart_stop_tx clears AML_UART_TX_EN (transmitter enable),
+    not TX_INT_EN. IRQ handler dispatches transmit_chars on TX_EN.
+  - meson_uart_shutdown skips line 0 (console), clears RX/TX enable +
+    INT enables, parks BIT 31 (UART_CTS_EN). No free_irq.
+  - meson_uart_startup mirrors stock EXACTLY: pulses
+    RX_RST | TX_RST | CLEAR_ERR (FIFO reset), enables RX/TX, enables
+    RX/TX interrupts AND clears UART_CTS_EN (BIT 31) to drop RTS LOW.
+    Does NOT touch AML_UART_MISC and does NOT request_irq.
+  - meson_uart_request_port writes MISC thresholds, sets BIT 31
+    (UART_CTS_EN) to park RTS HIGH, and request_irq once. release_port
+    free_irq.
+  - meson_receive_chars takes/releases port->lock internally so the
+    IRQ pattern is consistent (uart_prepare_sysrq_char path).
+  - meson_uart_set_termios drops port->lock BEFORE meson_uart_change_speed
+    so the busy-wait for TX_EMPTY at low bauds doesn't hold the port
+    lock.
+  - probe allocates the wrapper and skips the early request_port +
+    meson_uart_reset + release_port dance entirely. uart_add_one_port
+    -> request_port runs once.
+  - Per-port DT override "amlogic,xtal-div3" forces xtal/3 baud divisor
+    mode (no BAUD_XTAL_DIV2 bit) on G12A. Stock ran xtal/2 for uart_A
+    at 3M, which mainline G12A already defaults to with BAUD_XTAL_DIV2 set.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+diff --git a/drivers/tty/serial/meson_uart.c b/drivers/tty/serial/meson_uart.c
+index a6cb2a535..13073966c 100644
+--- a/drivers/tty/serial/meson_uart.c
++++ b/drivers/tty/serial/meson_uart.c
+@@ -79,7 +79,23 @@
+ static struct uart_driver meson_uart_driver_ttyAML;
+ static struct uart_driver meson_uart_driver_ttyS;
+
+-static struct uart_port *meson_ports[AML_UART_PORT_NUM];
++/*
++ * Wrap struct uart_port so we can carry a separate write-side spinlock
++ * (wr_lock) - mirrors Amlogic's downstream meson-uart driver. Releasing
++ * port->lock before the TX FIFO drain in the IRQ handler, and protecting
++ * concurrent TX writers with wr_lock, gives bringup the same lock
++ * granularity the BCM20703A2 has been validated against in
++ * Amlogic's downstream tree.
++ */
++struct meson_uart_port {
++	struct uart_port	port;
++	spinlock_t		wr_lock;
++};
++
++#define to_meson_port(uport) \
++	container_of(uport, struct meson_uart_port, port)
++
++static struct meson_uart_port *meson_ports[AML_UART_PORT_NUM];
+
+ struct meson_uart_data {
+ 	struct uart_driver *uart_driver;
+@@ -108,8 +124,13 @@ static void meson_uart_stop_tx(struct uart_port *port)
+ {
+ 	u32 val;
+
++	/*
++	 * Mirror downstream: clear TX_EN (transmitter enable),
++	 * not TX_INT_EN. Combined with the IRQ handler's TX_EN gate, this
++	 * is the lock-step pattern stock uses to start/stop the TX engine.
++	 */
+ 	val = readl(port->membase + AML_UART_CONTROL);
+-	val &= ~AML_UART_TX_INT_EN;
++	val &= ~AML_UART_TX_EN;
+ 	writel(val, port->membase + AML_UART_CONTROL);
+ }
+
+@@ -127,13 +148,25 @@ static void meson_uart_shutdown(struct uart_port *port)
+ 	unsigned long flags;
+ 	u32 val;
+
+-	free_irq(port->irq, port);
++	/*
++	 * Skip shutdown for the console port (line 0) - leaving the console
++	 * UART in TX_EN/RX_EN avoids losing late kernel printks across
++	 * userspace tty close. Stock 4.9 do the same line==0
++	 * guard.
++	 */
++	if (port->line == 0)
++		return;
+
++	/*
++	 * IRQ is owned by request_port/release_port now (downstream
++	 * pattern), not by startup/shutdown. No free_irq here.
++	 */
+ 	uart_port_lock_irqsave(port, &flags);
+
+ 	val = readl(port->membase + AML_UART_CONTROL);
+-	val &= ~AML_UART_RX_EN;
++	val &= ~(AML_UART_RX_EN | AML_UART_TX_EN);
+ 	val &= ~(AML_UART_RX_INT_EN | AML_UART_TX_INT_EN);
++	val |= BIT(31);  /* set UART_CTS_EN - park RTS HIGH like downstream */
+ 	writel(val, port->membase + AML_UART_CONTROL);
+
+ 	uart_port_unlock_irqrestore(port, flags);
+@@ -141,37 +174,65 @@ static void meson_uart_shutdown(struct uart_port *port)
+
+ static void meson_uart_start_tx(struct uart_port *port)
+ {
++	struct meson_uart_port *mup = to_meson_port(port);
++	unsigned char ch;
++	unsigned long flags;
++
++	/*
++	 * Mirror Amlogic's downstream's start_tx: protect the
++	 * raw FIFO drain with a separate wr_lock, drain bytes byte-by-byte
++	 * until either the HW FIFO is full or the kfifo is empty. x_char
++	 * (XON/XOFF) handling is done inside meson_transmit_chars (the IRQ
++	 * path) so that path also catches it on the next IRQ.
++	 */
++	spin_lock_irqsave(&mup->wr_lock, flags);
++	while (!(readl(port->membase + AML_UART_STATUS) & AML_UART_TX_FULL)) {
++		if (!uart_fifo_get(port, &ch))
++			break;
++		writel(ch, port->membase + AML_UART_WFIFO);
++	}
++	spin_unlock_irqrestore(&mup->wr_lock, flags);
++}
++
++/*
++ * IRQ-side TX drain (called from meson_uart_interrupt with port->lock NOT
++ * held - the IRQ handler releases it before calling us). Mirrors stock
++ * 4.9 layout: handle x_char first under port->lock, then take
++ * wr_lock and drain up to 256 bytes from the kfifo into the HW FIFO.
++ */
++static void meson_transmit_chars(struct uart_port *port)
++{
++	struct meson_uart_port *mup = to_meson_port(port);
+ 	struct tty_port *tport = &port->state->port;
+ 	unsigned char ch;
+-	u32 val;
++	int count = 256;
+
+-	if (uart_tx_stopped(port)) {
+-		meson_uart_stop_tx(port);
+-		return;
++	uart_port_lock(port);
++
++	if (port->x_char) {
++		writel(port->x_char, port->membase + AML_UART_WFIFO);
++		port->icount.tx++;
++		port->x_char = 0;
++		goto clear_and_return;
+ 	}
+
+-	while (!(readl(port->membase + AML_UART_STATUS) & AML_UART_TX_FULL)) {
+-		if (port->x_char) {
+-			writel(port->x_char, port->membase + AML_UART_WFIFO);
+-			port->icount.tx++;
+-			port->x_char = 0;
+-			continue;
+-		}
++	if (kfifo_is_empty(&tport->xmit_fifo) || uart_tx_stopped(port))
++		goto clear_and_return;
+
++	spin_lock(&mup->wr_lock);
++	while (count-- > 0 &&
++	       !(readl(port->membase + AML_UART_STATUS) & AML_UART_TX_FULL)) {
+ 		if (!uart_fifo_get(port, &ch))
+ 			break;
+-
+ 		writel(ch, port->membase + AML_UART_WFIFO);
+ 	}
+-
+-	if (!kfifo_is_empty(&tport->xmit_fifo)) {
+-		val = readl(port->membase + AML_UART_CONTROL);
+-		val |= AML_UART_TX_INT_EN;
+-		writel(val, port->membase + AML_UART_CONTROL);
+-	}
++	spin_unlock(&mup->wr_lock);
+
+ 	if (kfifo_len(&tport->xmit_fifo) < WAKEUP_CHARS)
+ 		uart_write_wakeup(port);
++
++clear_and_return:
++	uart_port_unlock(port);
+ }
+
+ static void meson_receive_chars(struct uart_port *port)
+@@ -180,6 +241,8 @@ static void meson_receive_chars(struct uart_port *port)
+ 	char flag;
+ 	u32 ostatus, status, ch, mode;
+
++	uart_port_lock(port);
++
+ 	do {
+ 		flag = TTY_NORMAL;
+ 		port->icount.rx++;
+@@ -229,24 +292,39 @@ static void meson_receive_chars(struct uart_port *port)
+
+ 	} while (!(readl(port->membase + AML_UART_STATUS) & AML_UART_RX_EMPTY));
+
++	uart_unlock_and_check_sysrq(port);
++
+ 	tty_flip_buffer_push(tport);
+ }
+
++/*
++ * IRQ handler. Mirrors stock 4.9's pattern: read CONTROL
++ * with port->lock briefly held, release the lock, then call into
++ * receive/transmit paths which re-take the locks themselves
++ * (port->lock for RX, port->lock + wr_lock for TX). This finer-grained
++ * locking is one of the very few real behavioural differences between
++ * mainline and downstream meson-uart and matches the only known-good
++ * BCM20703A2 BT bringup configuration.
++ *
++ * The TX trigger uses AML_UART_TX_EN (transmitter enable), not
++ * TX_INT_EN - see meson_uart_stop_tx and the BCM bringup notes for
++ * the rationale.
++ */
+ static irqreturn_t meson_uart_interrupt(int irq, void *dev_id)
+ {
+ 	struct uart_port *port = (struct uart_port *)dev_id;
++	u32 cflag;
+
+ 	uart_port_lock(port);
++	cflag = readl(port->membase + AML_UART_CONTROL);
++	uart_port_unlock(port);
+
+ 	if (!(readl(port->membase + AML_UART_STATUS) & AML_UART_RX_EMPTY))
+ 		meson_receive_chars(port);
+
+-	if (!(readl(port->membase + AML_UART_STATUS) & AML_UART_TX_FULL)) {
+-		if (readl(port->membase + AML_UART_CONTROL) & AML_UART_TX_INT_EN)
+-			meson_uart_start_tx(port);
+-	}
+-
+-	uart_unlock_and_check_sysrq(port);
++	if ((cflag & AML_UART_TX_EN) &&
++	    !(readl(port->membase + AML_UART_STATUS) & AML_UART_TX_FULL))
++		meson_transmit_chars(port);
+
+ 	return IRQ_HANDLED;
+ }
+@@ -278,33 +356,40 @@ static void meson_uart_reset(struct uart_port *port)
+
+ static int meson_uart_startup(struct uart_port *port)
+ {
+-	unsigned long flags;
+ 	u32 val;
+-	int ret = 0;
+-
+-	uart_port_lock_irqsave(port, &flags);
+
++	/*
++	 * Mirror Amlogic stock 4.9 (drivers/amlogic/uart/meson_uart.c)
++	 * startup sequence EXACTLY:
++	 *  - SET RX_RST | TX_RST | CLEAR_ERR, then CLEAR them. This pulses
++	 *    a hardware FIFO reset on both directions and clears any latched
++	 *    error bits. Stock does this on every startup. The BCM20703A2
++	 *    on the Spotify Car Thing requires the host UART to start from
++	 *    a fully-quiesced state - without the FIFO pulse stale RX bytes
++	 *    from u-boot/bootloader can confuse the chip's framing detector
++	 *    so it silently drops every post-Reset HCI command.
++	 *  - Enable RX/TX engines.
++	 *  - Enable RX/TX interrupts AND clear UART_CTS_EN (BIT 31) to
++	 *    drop RTS LOW. request_port parked it HIGH.
++	 *
++	 * Do NOT write AML_UART_MISC and do NOT request_irq here - both
++	 * happen once at meson_uart_request_port time, matching stock.
++	 */
+ 	val = readl(port->membase + AML_UART_CONTROL);
+-	val |= AML_UART_CLEAR_ERR;
++	val |= (AML_UART_RX_RST | AML_UART_TX_RST | AML_UART_CLEAR_ERR);
+ 	writel(val, port->membase + AML_UART_CONTROL);
+-	val &= ~AML_UART_CLEAR_ERR;
++
++	val &= ~(AML_UART_RX_RST | AML_UART_TX_RST | AML_UART_CLEAR_ERR);
+ 	writel(val, port->membase + AML_UART_CONTROL);
+
+ 	val |= (AML_UART_RX_EN | AML_UART_TX_EN);
+ 	writel(val, port->membase + AML_UART_CONTROL);
+
+ 	val |= (AML_UART_RX_INT_EN | AML_UART_TX_INT_EN);
++	val &= ~BIT(31);  /* clear UART_CTS_EN - drop RTS LOW for chip TX */
+ 	writel(val, port->membase + AML_UART_CONTROL);
+
+-	val = (AML_UART_RECV_IRQ(1) | AML_UART_XMIT_IRQ(port->fifosize / 2));
+-	writel(val, port->membase + AML_UART_MISC);
+-
+-	uart_port_unlock_irqrestore(port, flags);
+-
+-	ret = request_irq(port->irq, meson_uart_interrupt, 0,
+-			  port->name, port);
+-
+-	return ret;
++	return 0;
+ }
+
+ static void meson_uart_change_speed(struct uart_port *port, unsigned long baud)
+@@ -388,6 +473,15 @@ static void meson_uart_set_termios(struct uart_port *port,
+ 	}
+
+ 	writel(val, port->membase + AML_UART_CONTROL);
++	/*
++	 * Drop the port lock BEFORE meson_uart_change_speed - downstream /
++	 * downstream does this. change_speed busy-waits for TX_EMPTY which
++	 * can take milliseconds at low bauds; holding port->lock through
++	 * that starves other paths and (more importantly for our chip)
++	 * ties the CRTSCTS state-machine update to the baud reprogram in
++	 * a way the BCM20703A2 ROM is sensitive to.
++	 */
++	uart_port_unlock_irqrestore(port, flags);
+
+ 	baud = uart_get_baud_rate(port, termios, old, 50, 4000000);
+ 	meson_uart_change_speed(port, baud);
+@@ -403,7 +497,6 @@ static void meson_uart_set_termios(struct uart_port *port,
+ 					    AML_UART_FRAME_ERR;
+
+ 	uart_update_timeout(port, termios->c_cflag, baud);
+-	uart_port_unlock_irqrestore(port, flags);
+ }
+
+ static int meson_uart_verify_port(struct uart_port *port,
+@@ -422,6 +515,7 @@ static int meson_uart_verify_port(struct uart_port *port,
+
+ static void meson_uart_release_port(struct uart_port *port)
+ {
++	free_irq(port->irq, port);
+ 	devm_iounmap(port->dev, port->membase);
+ 	port->membase = NULL;
+ 	devm_release_mem_region(port->dev, port->mapbase, port->mapsize);
+@@ -429,6 +523,8 @@ static void meson_uart_release_port(struct uart_port *port)
+
+ static int meson_uart_request_port(struct uart_port *port)
+ {
++	u32 val;
++
+ 	if (!devm_request_mem_region(port->dev, port->mapbase, port->mapsize,
+ 				     dev_name(port->dev))) {
+ 		dev_err(port->dev, "Memory region busy\n");
+@@ -440,7 +536,26 @@ static int meson_uart_request_port(struct uart_port *port)
+ 	if (!port->membase)
+ 		return -ENOMEM;
+
+-	return 0;
++	/*
++	 * Mirror downstream:
++	 *  - program AML_UART_MISC IRQ thresholds (RECV=1, XMIT=fifosize/2)
++	 *  - set BIT(31) (UART_CTS_EN) to park RTS HIGH
++	 *  - request_irq HERE, not in startup. (downstream pattern:
++	 *    request_port owns the IRQ for the lifetime of the port.)
++	 *
++	 * meson_uart_startup later clears BIT(31) to drop RTS LOW for chip
++	 * TX. The HIGH→LOW transition is what the BCM20703A2 needs to
++	 * exit its post-Reset CTS-pending state.
++	 */
++	val = (AML_UART_RECV_IRQ(1) | AML_UART_XMIT_IRQ(port->fifosize / 2));
++	writel(val, port->membase + AML_UART_MISC);
++
++	val = readl(port->membase + AML_UART_CONTROL);
++	val |= BIT(31);  /* UART_CTS_EN - RTS HIGH at request_port */
++	writel(val, port->membase + AML_UART_CONTROL);
++
++	return request_irq(port->irq, meson_uart_interrupt, 0,
++			   meson_uart_type(port), port);
+ }
+
+ static void meson_uart_config_port(struct uart_port *port, int flags)
+@@ -578,9 +693,9 @@ static void meson_serial_console_write(struct console *co, const char *s,
+ {
+ 	struct uart_port *port;
+
+-	port = meson_ports[co->index];
+-	if (!port)
++	if (!meson_ports[co->index])
+ 		return;
++	port = &meson_ports[co->index]->port;
+
+ 	meson_serial_port_write(port, s, count);
+ }
+@@ -596,8 +711,10 @@ static int meson_serial_console_setup(struct console *co, char *options)
+ 	if (co->index < 0 || co->index >= AML_UART_PORT_NUM)
+ 		return -EINVAL;
+
+-	port = meson_ports[co->index];
+-	if (!port || !port->membase)
++	if (!meson_ports[co->index])
++		return -ENODEV;
++	port = &meson_ports[co->index]->port;
++	if (!port->membase)
+ 		return -ENODEV;
+
+ 	meson_uart_enable_tx_engine(port);
+@@ -736,16 +853,48 @@ static int meson_uart_probe(struct platform_device *pdev)
+ 				     "port %d already allocated\n", pdev->id);
+ 	}
+
+-	port = devm_kzalloc(&pdev->dev, sizeof(struct uart_port), GFP_KERNEL);
+-	if (!port)
+-		return -ENOMEM;
++	{
++		struct meson_uart_port *mup;
++
++		mup = devm_kzalloc(&pdev->dev, sizeof(*mup), GFP_KERNEL);
++		if (!mup)
++			return -ENOMEM;
++
++		spin_lock_init(&mup->wr_lock);
++		port = &mup->port;
++		meson_ports[pdev->id] = mup;
++	}
+
+ 	ret = meson_uart_probe_clocks(pdev, port);
+-	if (ret)
++	if (ret) {
++		meson_ports[pdev->id] = NULL;
+ 		return ret;
++	}
+
+ 	priv_data = device_get_match_data(&pdev->dev);
+
++	/*
++	 * Per-port DT override: "amlogic,xtal-div3" forces xtal/3 baud
++	 * divisor mode (no BAUD_XTAL_DIV2 bit) even on SoCs whose default
++	 * is xtal/2. Stock Amlogic 4.9 uses xtal/3 mode for uart_A on the
++	 * Spotify Car Thing (S905D2 / G12A); mainline's xtal/2 default
++	 * correlates with the BCM20703A2 going silent after HCI_Reset.
++	 * Both modes hit ~115200 within tolerance, so this is a chip-side
++	 * sensitivity to BAUD_XTAL_DIV2 (or to a side-effect of the alt
++	 * divisor path on this silicon revision), not a baud accuracy issue.
++	 */
++	if (priv_data && priv_data->has_xtal_div2 &&
++	    of_property_read_bool(pdev->dev.of_node, "amlogic,xtal-div3")) {
++		struct meson_uart_data *override;
++
++		override = devm_kmemdup(&pdev->dev, priv_data,
++					sizeof(*override), GFP_KERNEL);
++		if (!override)
++			return -ENOMEM;
++		override->has_xtal_div2 = false;
++		priv_data = override;
++	}
++
+ 	uart_driver = meson_uart_current(priv_data);
+
+ 	if (!uart_driver->state) {
+@@ -771,15 +920,16 @@ static int meson_uart_probe(struct platform_device *pdev)
+ 	port->fifosize = fifosize;
+ 	port->private_data = (void *)priv_data;
+
+-	meson_ports[pdev->id] = port;
+ 	platform_set_drvdata(pdev, port);
+
+-	/* reset port before registering (and possibly registering console) */
+-	if (meson_uart_request_port(port) >= 0) {
+-		meson_uart_reset(port);
+-		meson_uart_release_port(port);
+-	}
+-
++	/*
++	 * Skip the early meson_uart_request_port + meson_uart_reset +
++	 * meson_uart_release_port dance. Downstream never
++	 * does it. uart_add_one_port will call ->request_port itself,
++	 * which now also performs the MISC + UART_CTS_EN setup and
++	 * request_irq. Calling them once at uart_add_one_port time
++	 * matches the proven-working bring-up sequence.
++	 */
+ 	ret = uart_add_one_port(uart_driver, port);
+ 	if (ret)
+ 		meson_ports[pdev->id] = NULL;

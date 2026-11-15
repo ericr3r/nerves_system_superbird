@@ -1,0 +1,136 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Mon, 27 Apr 2026 15:07:58 -0400
+Subject: [PATCH 1/5] drm/bridge: dw-mipi-dsi: add skip_first_enable plat_data
+ hook
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add an optional plat_data callback that lets a glue driver suppress the
+bridge's enable / disable / post-disable cycle on the first transition.
+When the callback is provided and returns true, dw_mipi_dsi latches a
+sticky 'skip_active' flag and the three bridge ops short-circuit:
+
+  - atomic_pre_enable: skip dw_mipi_dsi_mode_set()
+  - atomic_enable:     skip dw_mipi_dsi_set_mode(VIDEO)
+  - post_atomic_disable: skip dw_mipi_dsi_set_mode(0), phy power_off,
+                         and the pclk/pm_runtime refcount drops
+
+The flag is sticky - once an enable is skipped, subsequent enables
+also skip and the matching disable path is a no-op for the rest of
+the bridge's lifetime. Glue drivers that need a 'real' enable later
+can either reprobe or refrain from returning true from skip_first_enable.
+
+Useful for platforms where an earlier boot stage has already brought
+the DSI link up against a panel that does not tolerate having its host
+reinitialized - DSI_PWR_UP RESET, host timing reprogramming, and PHY
+reset all happen inside dw_mipi_dsi_mode_set, and any one of them is
+sufficient to disturb a running link.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+ drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c | 40 +++++++++++++++++++
+ include/drm/bridge/dw_mipi_dsi.h              | 15 +++++++
+ 2 files changed, 55 insertions(+)
+
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c b/drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c
+index 8fc2e282f..c0624dded 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-mipi-dsi.c
+@@ -271,6 +271,14 @@ struct dw_mipi_dsi {
+
+ 	struct drm_display_mode mode;
+ 	const struct dw_mipi_dsi_plat_data *plat_data;
++
++	/*
++	 * Latched true on the first bridge enable transition where
++	 * plat_data->skip_first_enable returned true. While set, the bridge
++	 * enable / disable / post-disable callbacks all return early so the
++	 * controller is left in whatever state the caller arranged on entry.
++	 */
++	bool skip_active;
+ };
+
+ /*
+@@ -940,6 +948,15 @@ static void dw_mipi_dsi_bridge_post_atomic_disable(struct drm_bridge *bridge,
+ 	struct dw_mipi_dsi *dsi = bridge_to_dsi(bridge);
+ 	const struct dw_mipi_dsi_phy_ops *phy_ops = dsi->plat_data->phy_ops;
+
++	/*
++	 * When the matching enable was suppressed via skip_first_enable,
++	 * pclk and pm_runtime were never bumped and DSI_PWR_UP was never
++	 * touched. A teardown here would unbalance the refcounts and reset
++	 * a host that the caller asked us to leave alone.
++	 */
++	if (dsi->skip_active)
++		return;
++
+ 	/*
+ 	 * Switch to command mode before panel-bridge post_disable &
+ 	 * panel unprepare.
+@@ -1026,6 +1043,21 @@ static void dw_mipi_dsi_bridge_atomic_pre_enable(struct drm_bridge *bridge,
+ 						 struct drm_atomic_state *state)
+ {
+ 	struct dw_mipi_dsi *dsi = bridge_to_dsi(bridge);
++	const struct dw_mipi_dsi_plat_data *pdata = dsi->plat_data;
++
++	/*
++	 * If the platform glue opts out of the bridge's enable cycle on the
++	 * first transition, latch that decision for the lifetime of the
++	 * bridge. dw_mipi_dsi_mode_set drives DSI_PWR_UP RESET, reprograms
++	 * every host timing register, resets the D-PHY, and runs phy_ops
++	 * init/power_on - any of which can break a controller that the
++	 * caller has already configured.
++	 */
++	if (pdata->skip_first_enable && pdata->skip_first_enable(pdata->priv_data))
++		dsi->skip_active = true;
++
++	if (dsi->skip_active)
++		return;
+
+ 	/* Power up the dsi ctl into a command mode */
+ 	dw_mipi_dsi_mode_set(dsi, &dsi->mode);
+@@ -1048,6 +1080,14 @@ static void dw_mipi_dsi_bridge_atomic_enable(struct drm_bridge *bridge,
+ {
+ 	struct dw_mipi_dsi *dsi = bridge_to_dsi(bridge);
+
++	/*
++	 * dw_mipi_dsi_set_mode writes DSI_PWR_UP RESET → POWERUP, which
++	 * cycles the host out of and back into the running state. Skip when
++	 * the caller asked us to keep the controller untouched.
++	 */
++	if (dsi->skip_active)
++		return;
++
+ 	/* Switch to video mode for panel-bridge enable & panel enable */
+ 	dw_mipi_dsi_set_mode(dsi, MIPI_DSI_MODE_VIDEO);
+ 	if (dsi->slave)
+diff --git a/include/drm/bridge/dw_mipi_dsi.h b/include/drm/bridge/dw_mipi_dsi.h
+index 65d5e6806..5143a6f8b 100644
+--- a/include/drm/bridge/dw_mipi_dsi.h
++++ b/include/drm/bridge/dw_mipi_dsi.h
+@@ -73,6 +73,21 @@ struct dw_mipi_dsi_plat_data {
+ 	const struct dw_mipi_dsi_phy_ops *phy_ops;
+ 	const struct dw_mipi_dsi_host_ops *host_ops;
+
++	/*
++	 * Optional opt-out for the bridge enable cycle. When provided and
++	 * the callback returns true on the first bridge enable transition,
++	 * dw_mipi_dsi suppresses dw_mipi_dsi_mode_set() in atomic_pre_enable,
++	 * dw_mipi_dsi_set_mode(VIDEO) in atomic_enable, and the matching
++	 * post_atomic_disable teardown - leaving the controller in whatever
++	 * state it had on entry. Once skipped on the first enable, every
++	 * subsequent enable/disable is also skipped for the lifetime of the
++	 * bridge.
++	 *
++	 * Useful when an earlier boot stage has already brought the DSI link
++	 * up against a panel that does not tolerate re-initialization.
++	 */
++	bool (*skip_first_enable)(void *priv_data);
++
+ 	void *priv_data;
+ };
+
+--
+2.54.0

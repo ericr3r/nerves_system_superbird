@@ -103,11 +103,13 @@ defmodule NervesSystemSuperbird.MixProject do
   defp source_finger_print_files do
     [
       "config/config.exs",
+      "device_tree",
       "fwup_include",
+      "kernel",
+      "linux",
       "rootfs_overlay",
       "bootargs.txt",
       "fwup.conf",
-      "linux-6.6.defconfig",
       "mix.exs",
       "nerves_defconfig",
       "post-build.sh",
@@ -137,5 +139,4 @@ defmodule NervesSystemSuperbird.MixProject do
       primary_site -> ["BR2_PRIMARY_SITE=#{primary_site}"]
     end
   end
-
 end

@@ -1,0 +1,417 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Subject: [PATCH] Input: tlsc6x - add Telink TLSC6x capacitive touchscreen driver
+
+The Telink TLSC6x capacitive touch family (tlsc6206/6324/6440/...)
+ships in Spotify's Car Thing on i2c bus 0 at address 0x2e. Adapted
+from the GPL-v2 vendor BSP in Spotify's published superbird kernel
+(drivers/amlogic/input/touchscreen/tlsc6x/), pared down to mainline
+conventions: single .c file, devm_*, gpiod, threaded IRQ driven by
+DT interrupts-extended (Amlogic gpiochips lack .to_irq), modern MT-B
+slot reporting via input_mt_init_slots + INPUT_MT_DROP_UNUSED.
+
+Field firmware-update is not implemented: the chip ships flashed at
+the factory and the vendor BSP's update path skips on each boot too.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+diff --git a/drivers/input/touchscreen/Kconfig b/drivers/input/touchscreen/Kconfig
+index 7d5b72ee0..9fbf8d842 100644
+--- a/drivers/input/touchscreen/Kconfig
++++ b/drivers/input/touchscreen/Kconfig
+@@ -864,6 +864,22 @@ config TOUCHSCREEN_TI_AM335X_TSC
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called ti_am335x_tsc.
+
++config TOUCHSCREEN_TLSC6X
++	tristate "Telink TLSC6x capacitive touchscreens"
++	depends on I2C
++	depends on OF
++	select INPUT_MT
++	help
++	  Say Y here if your board has a Telink TLSC6x family
++	  capacitive touchscreen controller (tlsc6206, tlsc6324,
++	  tlsc6440 and friends). These chips were used by Spotify
++	  on the Car Thing.
++
++	  If unsure, say N.
++
++	  To compile this driver as a module, choose M here: the
++	  module will be called tlsc6x.
++
+ config TOUCHSCREEN_PIXCIR
+ 	tristate "PIXCIR I2C touchscreens"
+ 	depends on I2C
+diff --git a/drivers/input/touchscreen/Makefile b/drivers/input/touchscreen/Makefile
+index ab9abd151..9f353a988 100644
+--- a/drivers/input/touchscreen/Makefile
++++ b/drivers/input/touchscreen/Makefile
+@@ -89,6 +89,7 @@ obj-$(CONFIG_TOUCHSCREEN_SUN4I)		+= sun4i-ts.o
+ obj-$(CONFIG_TOUCHSCREEN_SUR40)		+= sur40.o
+ obj-$(CONFIG_TOUCHSCREEN_SURFACE3_SPI)	+= surface3_spi.o
+ obj-$(CONFIG_TOUCHSCREEN_TI_AM335X_TSC)	+= ti_am335x_tsc.o
++obj-$(CONFIG_TOUCHSCREEN_TLSC6X)	+= tlsc6x.o
+ obj-$(CONFIG_TOUCHSCREEN_TOUCHIT213)	+= touchit213.o
+ obj-$(CONFIG_TOUCHSCREEN_TOUCHRIGHT)	+= touchright.o
+ obj-$(CONFIG_TOUCHSCREEN_TOUCHWIN)	+= touchwin.o
+diff --git a/drivers/input/touchscreen/tlsc6x.c b/drivers/input/touchscreen/tlsc6x.c
+new file mode 100644
+index 000000000..a4d0b650f
+--- /dev/null
++++ b/drivers/input/touchscreen/tlsc6x.c
+@@ -0,0 +1,355 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Telink TLSC6x family capacitive touchscreen driver.
++ *
++ * Adapted from Spotify's Car Thing GPL-v2 BSP source
++ * (drivers/amlogic/input/touchscreen/tlsc6x/) for upstream-style
++ * mainline conventions: single .c file, devm_*, gpiod, threaded IRQ
++ * fed by interrupts-extended (Amlogic gpiochips lack .to_irq), modern
++ * multi-touch slot reporting. The chip's firmware is flashed at the
++ * factory; this driver does not implement the field-update path.
++ */
++
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/input/mt.h>
++#include <linux/input/touchscreen.h>
++#include <linux/interrupt.h>
++#include <linux/minmax.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/pm.h>
++#include <linux/property.h>
++#include <linux/regulator/consumer.h>
++
++#define TLSC6X_NAME		"tlsc6x"
++#define TLSC6X_MAX_FINGERS	2
++
++/*
++ * The chip's normal-mode register window starts at 0x00 with a packed
++ * touch-status block; reading 18 bytes drains the full report for
++ * TLSC6X_MAX_FINGERS contacts plus reserved trailing bytes.
++ */
++#define TLSC6X_REG_TOUCH_DATA	0x00
++#define TLSC6X_REPORT_LEN	18
++
++#define TLSC6X_REG_PMODE	0xa5
++#define TLSC6X_PMODE_SLEEP	0x03
++
++/* Per-finger flag layout in buf[3 + 6*i]: top two bits encode event. */
++#define TLSC6X_EVT_DOWN		0x00	/* touch-down / move */
++#define TLSC6X_EVT_UP		0x40	/* touch-up */
++#define TLSC6X_EVT_RESERVED	0x80
++#define TLSC6X_EVT_EMPTY	0xc0	/* no contact in this report slot */
++#define TLSC6X_EVT_MASK		0xc0
++
++#define TLSC6X_DEFAULT_X	480
++#define TLSC6X_DEFAULT_Y	800
++#define TLSC6X_PRESSURE_MAX	127
++#define TLSC6X_AREA_MAX		15
++
++struct tlsc6x_data {
++	struct i2c_client		*client;
++	struct input_dev		*input;
++	struct touchscreen_properties	prop;
++	struct gpio_desc		*reset_gpio;
++	struct regulator		*vdd;
++	struct regulator		*vddio;
++	u8				report[TLSC6X_REPORT_LEN];
++};
++
++static int tlsc6x_read_block(struct i2c_client *client, u8 reg,
++			     u8 *buf, size_t len)
++{
++	struct i2c_msg msgs[2] = {
++		{ .addr = client->addr, .flags = 0,
++		  .len = 1, .buf = &reg },
++		{ .addr = client->addr, .flags = I2C_M_RD,
++		  .len = len, .buf = buf },
++	};
++	int ret;
++
++	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
++	if (ret < 0)
++		return ret;
++	return ret == ARRAY_SIZE(msgs) ? 0 : -EIO;
++}
++
++static int tlsc6x_write_reg(struct i2c_client *client, u8 reg, u8 val)
++{
++	u8 buf[2] = { reg, val };
++	int ret = i2c_master_send(client, buf, sizeof(buf));
++
++	if (ret < 0)
++		return ret;
++	return ret == sizeof(buf) ? 0 : -EIO;
++}
++
++/*
++ * Reset sequence cribbed from stock tlsc6x_tpd_reset(): drive HIGH for
++ * 1 ms, LOW for 20 ms (held in reset), HIGH for 30 ms (boot settle).
++ * The DT marks the line GPIO_ACTIVE_HIGH, so gpiod_set_value(1) drives
++ * the SoC pin HIGH which matches the chip's nRESET input convention.
++ */
++static void tlsc6x_reset_pulse(struct tlsc6x_data *ts)
++{
++	gpiod_set_value_cansleep(ts->reset_gpio, 1);
++	usleep_range(1000, 1500);
++	gpiod_set_value_cansleep(ts->reset_gpio, 0);
++	msleep(20);
++	gpiod_set_value_cansleep(ts->reset_gpio, 1);
++	msleep(30);
++}
++
++static void tlsc6x_release_all(struct input_dev *input)
++{
++	int i;
++
++	for (i = 0; i < TLSC6X_MAX_FINGERS; i++) {
++		input_mt_slot(input, i);
++		input_mt_report_slot_state(input, MT_TOOL_FINGER, false);
++	}
++	input_mt_sync_frame(input);
++	input_sync(input);
++}
++
++/*
++ * Touch-report layout (per finger, 6 bytes starting at buf[3 + 6*i]):
++ *   p[0] = top 2 bits: event flags (see TLSC6X_EVT_*); low 4 bits: X[11:8]
++ *   p[1] = X[7:0]
++ *   p[2] = top 4 bits: track ID (slot); low 4 bits: Y[11:8]
++ *   p[3] = Y[7:0]
++ *   p[4] = pressure (0..127)
++ *   p[5] = top 4 bits: touch-major (0..15); low 4 bits reserved
++ *
++ * The slot ID lives in the report, not the iteration index - the chip
++ * may shuffle which slot occupies which 6-byte block frame to frame.
++ */
++static void tlsc6x_process_report(struct tlsc6x_data *ts)
++{
++	const u8 *buf = ts->report;
++	int i;
++
++	for (i = 0; i < TLSC6X_MAX_FINGERS; i++) {
++		const u8 *p = &buf[3 + 6 * i];
++		u8 flags = p[0] & TLSC6X_EVT_MASK;
++		unsigned int slot, x, y;
++		u8 pressure, area;
++
++		if (flags == TLSC6X_EVT_EMPTY)
++			continue;
++
++		slot = p[2] >> 4;
++		if (slot >= TLSC6X_MAX_FINGERS)
++			continue;
++
++		input_mt_slot(ts->input, slot);
++
++		if (flags == TLSC6X_EVT_UP) {
++			input_mt_report_slot_state(ts->input,
++						   MT_TOOL_FINGER, false);
++			continue;
++		}
++
++		x = ((p[0] & 0x0f) << 8) | p[1];
++		y = ((p[2] & 0x0f) << 8) | p[3];
++		pressure = min_t(u8, p[4], TLSC6X_PRESSURE_MAX);
++		area = (p[5] >> 4) & 0x0f;
++
++		input_mt_report_slot_state(ts->input, MT_TOOL_FINGER, true);
++		touchscreen_report_pos(ts->input, &ts->prop, x, y, true);
++		input_report_abs(ts->input, ABS_MT_PRESSURE, pressure);
++		input_report_abs(ts->input, ABS_MT_TOUCH_MAJOR, area);
++	}
++
++	/*
++	 * INPUT_MT_DROP_UNUSED in the slot init means any slot we didn't
++	 * visit this frame is automatically released by mt_sync_frame.
++	 */
++	input_mt_sync_frame(ts->input);
++	input_sync(ts->input);
++}
++
++static irqreturn_t tlsc6x_irq(int irq, void *dev_id)
++{
++	struct tlsc6x_data *ts = dev_id;
++	int ret;
++
++	ret = tlsc6x_read_block(ts->client, TLSC6X_REG_TOUCH_DATA,
++				ts->report, sizeof(ts->report));
++	if (ret < 0) {
++		dev_dbg(&ts->client->dev, "i2c read failed: %d\n", ret);
++		return IRQ_HANDLED;
++	}
++
++	tlsc6x_process_report(ts);
++	return IRQ_HANDLED;
++}
++
++static int tlsc6x_power_on(struct tlsc6x_data *ts)
++{
++	int ret;
++
++	ret = regulator_enable(ts->vdd);
++	if (ret)
++		return ret;
++
++	ret = regulator_enable(ts->vddio);
++	if (ret) {
++		regulator_disable(ts->vdd);
++		return ret;
++	}
++	return 0;
++}
++
++static void tlsc6x_power_off(void *opaque)
++{
++	struct tlsc6x_data *ts = opaque;
++
++	regulator_disable(ts->vddio);
++	regulator_disable(ts->vdd);
++}
++
++static int tlsc6x_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct tlsc6x_data *ts;
++	struct input_dev *input;
++	u8 dummy;
++	int ret;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return -ENODEV;
++
++	if (client->irq <= 0)
++		return dev_err_probe(dev, -EINVAL,
++			"no IRQ; wire interrupts-extended in DT\n");
++
++	ts = devm_kzalloc(dev, sizeof(*ts), GFP_KERNEL);
++	if (!ts)
++		return -ENOMEM;
++
++	ts->client = client;
++	i2c_set_clientdata(client, ts);
++
++	ts->vdd = devm_regulator_get(dev, "vdd");
++	if (IS_ERR(ts->vdd))
++		return dev_err_probe(dev, PTR_ERR(ts->vdd), "get vdd failed\n");
++
++	ts->vddio = devm_regulator_get(dev, "vddio");
++	if (IS_ERR(ts->vddio))
++		return dev_err_probe(dev, PTR_ERR(ts->vddio),
++				     "get vddio failed\n");
++
++	ret = tlsc6x_power_on(ts);
++	if (ret)
++		return dev_err_probe(dev, ret, "regulator enable failed\n");
++
++	ret = devm_add_action_or_reset(dev, tlsc6x_power_off, ts);
++	if (ret)
++		return ret;
++
++	ts->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
++	if (IS_ERR(ts->reset_gpio))
++		return dev_err_probe(dev, PTR_ERR(ts->reset_gpio),
++				     "get reset gpio failed\n");
++
++	tlsc6x_reset_pulse(ts);
++
++	/* Liveness probe: chip must ACK a 1-byte read at register 0. */
++	ret = tlsc6x_read_block(client, TLSC6X_REG_TOUCH_DATA, &dummy, 1);
++	if (ret < 0)
++		return dev_err_probe(dev, ret,
++				     "no response from chip at 0x%02x\n",
++				     client->addr);
++
++	input = devm_input_allocate_device(dev);
++	if (!input)
++		return -ENOMEM;
++
++	input->name = TLSC6X_NAME;
++	input->phys = "i2c/" TLSC6X_NAME;
++	input->id.bustype = BUS_I2C;
++
++	input_set_capability(input, EV_KEY, BTN_TOUCH);
++	input_set_abs_params(input, ABS_MT_POSITION_X,
++			     0, TLSC6X_DEFAULT_X - 1, 0, 0);
++	input_set_abs_params(input, ABS_MT_POSITION_Y,
++			     0, TLSC6X_DEFAULT_Y - 1, 0, 0);
++	input_set_abs_params(input, ABS_MT_PRESSURE,
++			     0, TLSC6X_PRESSURE_MAX, 0, 0);
++	input_set_abs_params(input, ABS_MT_TOUCH_MAJOR,
++			     0, TLSC6X_AREA_MAX, 0, 0);
++
++	touchscreen_parse_properties(input, true, &ts->prop);
++
++	ret = input_mt_init_slots(input, TLSC6X_MAX_FINGERS,
++				  INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "input_mt_init_slots failed\n");
++
++	ts->input = input;
++
++	ret = input_register_device(input);
++	if (ret)
++		return dev_err_probe(dev, ret,
++				     "input_register_device failed\n");
++
++	ret = devm_request_threaded_irq(dev, client->irq, NULL, tlsc6x_irq,
++					IRQF_ONESHOT, TLSC6X_NAME, ts);
++	if (ret)
++		return dev_err_probe(dev, ret, "request_irq failed\n");
++
++	return 0;
++}
++
++static int tlsc6x_suspend(struct device *dev)
++{
++	struct tlsc6x_data *ts = i2c_get_clientdata(to_i2c_client(dev));
++
++	disable_irq(ts->client->irq);
++	tlsc6x_write_reg(ts->client, TLSC6X_REG_PMODE, TLSC6X_PMODE_SLEEP);
++	tlsc6x_release_all(ts->input);
++	return 0;
++}
++
++static int tlsc6x_resume(struct device *dev)
++{
++	struct tlsc6x_data *ts = i2c_get_clientdata(to_i2c_client(dev));
++
++	tlsc6x_reset_pulse(ts);
++	enable_irq(ts->client->irq);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(tlsc6x_pm, tlsc6x_suspend, tlsc6x_resume);
++
++static const struct of_device_id tlsc6x_of_match[] = {
++	{ .compatible = "telink,tlsc6x" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, tlsc6x_of_match);
++
++static const struct i2c_device_id tlsc6x_id[] = {
++	{ TLSC6X_NAME, 0 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, tlsc6x_id);
++
++static struct i2c_driver tlsc6x_driver = {
++	.driver = {
++		.name = TLSC6X_NAME,
++		.of_match_table = tlsc6x_of_match,
++		.pm = pm_sleep_ptr(&tlsc6x_pm),
++	},
++	.probe = tlsc6x_probe,
++	.id_table = tlsc6x_id,
++};
++module_i2c_driver(tlsc6x_driver);
++
++MODULE_DESCRIPTION("Telink TLSC6x capacitive touchscreen driver");
++MODULE_AUTHOR("Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>");
++MODULE_LICENSE("GPL v2");

@@ -1,0 +1,40 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Mon, 27 Apr 2026 15:12:08 -0400
+Subject: [PATCH 5/5] drm/meson: disable pipeline dither on MIPI DSI mode set
+
+L_DITH_CNTL_DITH10_EN enables a 10-bit dither LFSR in the ENCL output
+stage. On a panel fed from an 8-bit framebuffer the dither has nothing
+to dither against and emits pseudo-random LSB noise that appears as
+speckle on solid colours.
+
+Write 0 to L_DITH_CNTL_ADDR in meson_venc_mipi_dsi_mode_set so the
+dither stays off for DSI panels.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+ drivers/gpu/drm/meson/meson_venc.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_venc.c b/drivers/gpu/drm/meson/meson_venc.c
+index 3bf0d6e4f..e4a00e394 100644
+--- a/drivers/gpu/drm/meson/meson_venc.c
++++ b/drivers/gpu/drm/meson/meson_venc.c
+@@ -1696,7 +1696,13 @@ void meson_venc_mipi_dsi_mode_set(struct meson_drm *priv,
+ 	writel_relaxed(0, priv->io_base + _REG(L_RGB_BASE_ADDR));
+ 	writel_relaxed(0x400, priv->io_base + _REG(L_RGB_COEFF_ADDR)); /* Magic value */
+ 
+-	writel_relaxed(L_DITH_CNTL_DITH10_EN, priv->io_base + _REG(L_DITH_CNTL_ADDR));
++	/*
++	 * Disable pipeline dithering on the MIPI DSI path. Pipeline
++	 * dithering targets a 10-bit ENCL output; on a panel fed from an
++	 * 8-bit framebuffer it just adds pseudo-random LSB noise that
++	 * shows up as speckle on solid colours.
++	 */
++	writel_relaxed(0, priv->io_base + _REG(L_DITH_CNTL_ADDR));
+ 
+ 	/* DE signal for TTL */
+ 	writel_relaxed(havon_begin, priv->io_base + _REG(L_OEH_HS_ADDR));
+-- 
+2.54.0
+

@@ -1,0 +1,92 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Subject: [PATCH] pinctrl: meson: handle PIN_CONFIG_INPUT_ENABLE and bare PIN_CONFIG_DRIVE_STRENGTH
+
+Mainline meson_pinconf_set silently drops two parameters that the
+Amlogic downstream pinctrl driver honours:
+
+  - PIN_CONFIG_INPUT_ENABLE   (DT: input-enable;)
+  - PIN_CONFIG_DRIVE_STRENGTH (DT: drive-strength = <N>;, N = 0..3,
+    where the encoding maps directly to the SoC's 2-bit drive-strength
+    register field - 500uA / 2.5mA / 3mA / 4mA on G12A)
+
+Mainline only handles PIN_CONFIG_DRIVE_STRENGTH_UA (DT:
+drive-strength-microamp = <X>;) and never handled the bare form, so
+DTs ported from the downstream tree silently lose drive-strength
+specs. PIN_CONFIG_INPUT_ENABLE has no handler at all.
+
+Both are needed for the Spotify Car Thing's BCM20703A2 BT chip wake
+pins, which expect:
+
+    bt_wake_host: ... { input-enable; };
+    host_wake_bt: ... { output-enable;
+                        drive-strength = <1>; };
+
+Add PIN_CONFIG_DRIVE_STRENGTH as a direct passthrough to the
+pinctrl-meson DS register and PIN_CONFIG_INPUT_ENABLE as a wrapper
+around meson_pinconf_set_output with !arg - the smallest change that
+makes those DT properties reach the hardware.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+--- a/drivers/pinctrl/meson/pinctrl-meson.c
++++ b/drivers/pinctrl/meson/pinctrl-meson.c
+@@ -358,7 +358,9 @@
+ 		param = pinconf_to_config_param(configs[i]);
+
+ 		switch (param) {
++		case PIN_CONFIG_DRIVE_STRENGTH:
+ 		case PIN_CONFIG_DRIVE_STRENGTH_UA:
++		case PIN_CONFIG_INPUT_ENABLE:
+ 		case PIN_CONFIG_OUTPUT_ENABLE:
+ 		case PIN_CONFIG_LEVEL:
+ 			arg = pinconf_to_config_argument(configs[i]);
+@@ -378,9 +380,48 @@
+ 		case PIN_CONFIG_BIAS_PULL_DOWN:
+ 			ret = meson_pinconf_enable_bias(pc, pin, false);
+ 			break;
++		case PIN_CONFIG_DRIVE_STRENGTH:
++			/*
++			 * Bare drive-strength = <N> form (N=0..3 → register
++			 * bits 0..3 mapping directly to 500uA / 2.5mA / 3mA
++			 * / 4mA on G12A). Mainline only handled the
++			 * DRIVE_STRENGTH_UA form.
++			 */
++			if (!pc->reg_ds) {
++				ret = -ENOTSUPP;
++				break;
++			}
++			if (arg > 3) {
++				dev_warn_once(pc->dev,
++					      "pin %u: invalid drive-strength %u, expect 0..3\n",
++					      pin, arg);
++				arg = 3;
++			}
++			{
++				const struct meson_bank *bank;
++				unsigned int reg, bit;
++
++				ret = meson_get_bank(pc, pin, &bank);
++				if (ret)
++					break;
++				meson_calc_reg_and_bit(bank, pin,
++						       MESON_REG_DS, &reg, &bit);
++				ret = regmap_update_bits(pc->reg_ds, reg,
++							 0x3 << bit,
++							 (arg & 0x3) << bit);
++			}
++			break;
+ 		case PIN_CONFIG_DRIVE_STRENGTH_UA:
+ 			ret = meson_pinconf_set_drive_strength(pc, pin, arg);
+ 			break;
++		case PIN_CONFIG_INPUT_ENABLE:
++			/*
++			 * Stock pinconf-meson-common honours input-enable by
++			 * setting MESON_REG_DIR=input (bit=1). Mainline used
++			 * to silently drop it. Now mirrored.
++			 */
++			ret = meson_pinconf_set_output(pc, pin, !arg);
++			break;
+ 		case PIN_CONFIG_OUTPUT_ENABLE:
+ 			ret = meson_pinconf_set_output(pc, pin, arg);
+ 			break;

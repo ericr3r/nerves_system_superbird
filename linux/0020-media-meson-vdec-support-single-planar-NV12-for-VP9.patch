@@ -1,0 +1,204 @@
+From 507a72d30b34a754074e7e196f091fca8327b0d1 Mon Sep 17 00:00:00 2001
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Thu, 30 Jul 2026 01:10:00 -0400
+Subject: [PATCH] media: meson: vdec: support single-planar NV12 for VP9
+
+Extend the single-buffer NV12 CAPTURE format to VP9. The H.264 arm went in
+with the canvas helper; VP9 does not use canvases. It reaches its output
+through the SAO writer, programming the luma and chroma start addresses as
+raw physical addresses and reading plane 1 directly, so it needs its own
+arm before the format can be advertised for it.
+
+Three places take the chroma address: the two codec_hevc_setup_buffers()
+variants and codec_vp9_set_sao(). Route all of them through one helper that
+returns plane 1 for the multi-planar format and luma-size past plane 0 for
+the single-planar one, so there is no second way to compute it.
+
+HEVC_SAO_Y_LENGTH needs care. It bounds what the SAO writer may fill, and
+was set from amvdec_get_output_size(), which rounds up to 64 KiB. For the
+multi-planar format that is harmless because luma has its own allocation,
+but with chroma sitting immediately after luma in one buffer the writer
+would run into it. Bound it by the padded luma plane instead, which is what
+the reported bytesperline and height describe, and halve the same value for
+chroma rather than deriving it separately.
+
+The remaining pixfmt_cap equality tests meant "uncompressed NV12 output"
+rather than "multi-planar", so they become a predicate that accepts both.
+The 10-bit paths are untouched: framebuffer compression, downsampling and
+the IOMMU are all gated on is_10bit and keep using their own buffers.
+
+Tested on a Spotify Car Thing (Amlogic G12A) decoding VP9 and H.264 through
+chromium's V4L2 stateful decoder.
+
+Upstream-Status: Pending
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+---
+ .../media/meson/vdec/codec_hevc_common.c      |  6 ++--
+ .../media/meson/vdec/codec_hevc_common.h      | 32 +++++++++++++++++++
+ drivers/staging/media/meson/vdec/codec_vp9.c  | 11 +++----
+ .../staging/media/meson/vdec/vdec_platform.c  |  8 ++---
+ 4 files changed, 44 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc_common.c b/drivers/staging/media/meson/vdec/codec_hevc_common.c
+index 0315cc0..a996fb8 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc_common.c
++++ b/drivers/staging/media/meson/vdec/codec_hevc_common.c
+@@ -83,7 +83,7 @@ static void codec_hevc_setup_buffers_gxbb(struct amvdec_session *sess,
+ 			amvdec_write_dos(core, HEVCD_MPP_ANC2AXI_TBL_CMD_ADDR,
+ 					 val);
+ 		} else {
+-			buf_uv_paddr = vb2_dma_contig_plane_dma_addr(vb, 1);
++			buf_uv_paddr = codec_hevc_chroma_addr(sess, vb);
+ 			val = buf_y_paddr | ((idx * 2) << 8) | 1;
+ 			amvdec_write_dos(core, HEVCD_MPP_ANC2AXI_TBL_CMD_ADDR,
+ 					 val);
+@@ -138,7 +138,7 @@ static void codec_hevc_setup_buffers_gxl(struct amvdec_session *sess,
+ 				 buf_y_paddr >> 5);
+ 
+ 		if (!codec_hevc_use_fbc(pixfmt_cap, is_10bit)) {
+-			buf_uv_paddr = vb2_dma_contig_plane_dma_addr(vb, 1);
++			buf_uv_paddr = codec_hevc_chroma_addr(sess, vb);
+ 			amvdec_write_dos(core, HEVCD_MPP_ANC2AXI_TBL_DATA,
+ 					 buf_uv_paddr >> 5);
+ 		}
+@@ -286,7 +286,7 @@ void codec_hevc_fill_mmu_map(struct amvdec_session *sess,
+ 	u32 first_page;
+ 	u32 i;
+ 
+-	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M)
++	if (codec_hevc_is_nv12(sess->pixfmt_cap))
+ 		first_page = comm->fbc_buffer_paddr[vb->index] >> PAGE_SHIFT;
+ 	else
+ 		first_page = vb2_dma_contig_plane_dma_addr(vb, 0) >> PAGE_SHIFT;
+diff --git a/drivers/staging/media/meson/vdec/codec_hevc_common.h b/drivers/staging/media/meson/vdec/codec_hevc_common.h
+index cf072b8..6a0709e 100644
+--- a/drivers/staging/media/meson/vdec/codec_hevc_common.h
++++ b/drivers/staging/media/meson/vdec/codec_hevc_common.h
+@@ -7,6 +7,8 @@
+ #ifndef __MESON_VDEC_HEVC_COMMON_H_
+ #define __MESON_VDEC_HEVC_COMMON_H_
+ 
++#include <media/videobuf2-dma-contig.h>
++
+ #include "vdec.h"
+ 
+ #define PARSER_CMD_SKIP_CFG_0 0x0000090b
+@@ -49,6 +51,36 @@ static inline int codec_hevc_use_mmu(u32 revision, u32 pixfmt, int is_10bit)
+ 	       codec_hevc_use_fbc(pixfmt, is_10bit);
+ }
+ 
++/* Returns 1 for an uncompressed NV12 output, single- or multi-planar */
++static inline int codec_hevc_is_nv12(u32 pixfmt)
++{
++	return pixfmt == V4L2_PIX_FMT_NV12M || pixfmt == V4L2_PIX_FMT_NV12;
++}
++
++/*
++ * Luma plane size the SAO writer is allowed to fill. Single-buffer NV12 keeps
++ * chroma immediately after luma, so the write has to stop at the chroma start
++ * rather than at the 64 KiB-aligned allocation size.
++ */
++static inline u32 codec_hevc_luma_size(struct amvdec_session *sess)
++{
++	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12)
++		return amvdec_get_luma_size(sess);
++
++	return amvdec_get_output_size(sess);
++}
++
++/* Start of chroma for the current CAPTURE format */
++static inline dma_addr_t codec_hevc_chroma_addr(struct amvdec_session *sess,
++						struct vb2_buffer *vb)
++{
++	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12)
++		return vb2_dma_contig_plane_dma_addr(vb, 0) +
++		       codec_hevc_luma_size(sess);
++
++	return vb2_dma_contig_plane_dma_addr(vb, 1);
++}
++
+ /* Configure decode head read mode */
+ void codec_hevc_setup_decode_head(struct amvdec_session *sess, int is_10bit);
+ 
+diff --git a/drivers/staging/media/meson/vdec/codec_vp9.c b/drivers/staging/media/meson/vdec/codec_vp9.c
+index 8e80ecf..8a83b7f 100644
+--- a/drivers/staging/media/meson/vdec/codec_vp9.c
++++ b/drivers/staging/media/meson/vdec/codec_vp9.c
+@@ -907,11 +907,10 @@ static void codec_vp9_set_sao(struct amvdec_session *sess,
+ 		amvdec_write_dos(core, HEVC_CM_BODY_START_ADDR, buf_y_paddr);
+ 	}
+ 
+-	if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M) {
++	if (codec_hevc_is_nv12(sess->pixfmt_cap)) {
+ 		buf_y_paddr =
+ 		       vb2_dma_contig_plane_dma_addr(vb, 0);
+-		buf_u_v_paddr =
+-		       vb2_dma_contig_plane_dma_addr(vb, 1);
++		buf_u_v_paddr = codec_hevc_chroma_addr(sess, vb);
+ 		amvdec_write_dos(core, HEVC_SAO_Y_START_ADDR, buf_y_paddr);
+ 		amvdec_write_dos(core, HEVC_SAO_C_START_ADDR, buf_u_v_paddr);
+ 		amvdec_write_dos(core, HEVC_SAO_Y_WPTR, buf_y_paddr);
+@@ -927,9 +926,9 @@ static void codec_vp9_set_sao(struct amvdec_session *sess,
+ 	}
+ 
+ 	amvdec_write_dos(core, HEVC_SAO_Y_LENGTH,
+-			 amvdec_get_output_size(sess));
++			 codec_hevc_luma_size(sess));
+ 	amvdec_write_dos(core, HEVC_SAO_C_LENGTH,
+-			 (amvdec_get_output_size(sess) / 2));
++			 (codec_hevc_luma_size(sess) / 2));
+ 
+ 	if (core->platform->revision >= VDEC_REVISION_G12A) {
+ 		amvdec_clear_dos_bits(core, HEVC_DBLK_CFGB,
+@@ -939,7 +938,7 @@ static void codec_vp9_set_sao(struct amvdec_session *sess,
+ 			amvdec_write_dos_bits(core, HEVC_DBLK_CFGB, BIT(8));
+ 
+ 		/* enable second, uncompressed write */
+-		if (sess->pixfmt_cap == V4L2_PIX_FMT_NV12M)
++		if (codec_hevc_is_nv12(sess->pixfmt_cap))
+ 			amvdec_write_dos_bits(core, HEVC_DBLK_CFGB, BIT(9));
+ 
+ 		/* dblk pipeline mode=1 for performance */
+diff --git a/drivers/staging/media/meson/vdec/vdec_platform.c b/drivers/staging/media/meson/vdec/vdec_platform.c
+index 958dea2..c143212 100644
+--- a/drivers/staging/media/meson/vdec/vdec_platform.c
++++ b/drivers/staging/media/meson/vdec/vdec_platform.c
+@@ -61,7 +61,7 @@ static const struct amvdec_format vdec_formats_gxl[] = {
+ 		.vdec_ops = &vdec_hevc_ops,
+ 		.codec_ops = &codec_vp9_ops,
+ 		.firmware_path = "meson/vdec/gxl_vp9.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+@@ -149,7 +149,7 @@ static const struct amvdec_format vdec_formats_gxm[] = {
+ 		.vdec_ops = &vdec_hevc_ops,
+ 		.codec_ops = &codec_vp9_ops,
+ 		.firmware_path = "meson/vdec/gxl_vp9.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+@@ -199,7 +199,7 @@ static const struct amvdec_format vdec_formats_g12a[] = {
+ 		.vdec_ops = &vdec_hevc_ops,
+ 		.codec_ops = &codec_vp9_ops,
+ 		.firmware_path = "meson/vdec/g12a_vp9.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+@@ -249,7 +249,7 @@ static const struct amvdec_format vdec_formats_sm1[] = {
+ 		.vdec_ops = &vdec_hevc_ops,
+ 		.codec_ops = &codec_vp9_ops,
+ 		.firmware_path = "meson/vdec/sm1_vp9_mmu.bin",
+-		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, 0 },
++		.pixfmts_cap = { V4L2_PIX_FMT_NV12M, V4L2_PIX_FMT_NV12, 0 },
+ 		.flags = V4L2_FMT_FLAG_COMPRESSED |
+ 			 V4L2_FMT_FLAG_DYN_RESOLUTION,
+ 	}, {
+-- 
+2.53.0
+

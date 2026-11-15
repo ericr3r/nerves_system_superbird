@@ -1,0 +1,75 @@
+From 1d8b91efff914e6ef024669e1a9776910881c3ce Mon Sep 17 00:00:00 2001
+From: Neel Patel <108803410+68p@users.noreply.github.com>
+Date: Wed, 19 Aug 2026 17:18:00 -0400
+Subject: [PATCH] media: meson: vdec: wait for source change with empty output
+
+Stateful decoders start the OUTPUT queue first, consume enough compressed
+data to determine the coded format, emit V4L2_EVENT_SOURCE_CHANGE, and only
+then let userspace allocate and start the CAPTURE queue.
+
+The Meson decoder completes an OUTPUT buffer as soon as the ESPARSER has
+consumed it.  A low-latency stream can therefore briefly have no queued
+OUTPUT buffer while CAPTURE is intentionally not streaming.  The generic
+mem2mem poll helper reports EPOLLERR when both queues lack pollable data.
+GStreamer's stateful decoder treats that transient EPOLLERR as fatal while it
+is waiting for V4L2_EVENT_SOURCE_CHANGE, before the next access unit can be
+queued.
+
+Use a Meson-specific poll wrapper and suppress only that transient EPOLLERR:
+OUTPUT must be streaming without a queue error, CAPTURE must not yet be
+streaming, and the decoder must be initializing or waiting for CAPTURE to be
+reconfigured.  The generic helper has already registered all buffer and event
+wait queues, so returning no event blocks normally until either more data or
+the source-change event arrives.  Preserve EPOLLERR for stopped sessions and
+real vb2 queue errors.
+
+Upstream-Status: Pending
+Signed-off-by: Neel Patel <108803410+68p@users.noreply.github.com>
+---
+ drivers/staging/media/meson/vdec/vdec.c | 26 +++++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/media/meson/vdec/vdec.c b/drivers/staging/media/meson/vdec/vdec.c
+index 3f8f3f7..5d4ed59 100644
+--- a/drivers/staging/media/meson/vdec/vdec.c
++++ b/drivers/staging/media/meson/vdec/vdec.c
+@@ -997,12 +997,36 @@ static int vdec_close(struct file *file)
+ 	return 0;
+ }
+ 
++static __poll_t vdec_poll(struct file *file, poll_table *wait)
++{
++	struct amvdec_session *sess = file_to_amvdec_session(file);
++	struct vb2_queue *src_q = v4l2_m2m_get_src_vq(sess->m2m_ctx);
++	__poll_t ret;
++
++	ret = v4l2_m2m_fop_poll(file, wait);
++
++	/*
++	 * Before the first source-change event, CAPTURE is deliberately not
++	 * streaming.  If ESPARSER consumes the only queued OUTPUT buffer, the
++	 * generic mem2mem helper reports EPOLLERR even though the decoder is
++	 * healthy and all event wait queues have been registered.
++	 */
++	if ((ret & EPOLLERR) &&
++	    sess->streamon_out && !sess->streamon_cap &&
++	    !src_q->error &&
++	    (sess->status == STATUS_INIT ||
++	     sess->status == STATUS_NEEDS_RESUME))
++		ret &= ~EPOLLERR;
++
++	return ret;
++}
++
+ static const struct v4l2_file_operations vdec_fops = {
+ 	.owner = THIS_MODULE,
+ 	.open = vdec_open,
+ 	.release = vdec_close,
+ 	.unlocked_ioctl = video_ioctl2,
+-	.poll = v4l2_m2m_fop_poll,
++	.poll = vdec_poll,
+ 	.mmap = v4l2_m2m_fop_mmap,
+ };
+ 
+-- 
+2.53.0

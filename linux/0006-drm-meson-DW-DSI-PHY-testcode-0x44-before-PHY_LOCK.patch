@@ -1,0 +1,106 @@
+From: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Date: Mon, 27 Apr 2026 15:11:52 -0400
+Subject: [PATCH 4/5] drm/meson: write DW DSI PHY testcode 0x44 before PHY_LOCK
+ poll
+
+The DW MIPI DSI PHY does not lock for the configurations this glue
+driver hands to dw-mipi-dsi unless test register 0x44 is programmed
+to 0x74 before PHY_RSTZ release. Without it, dw_mipi_dsi_dphy_enable's
+PHY_LOCK poll times out on cold init and the encoder never starts
+clocking.
+
+Two changes inside dw_mipi_dsi_phy_init:
+
+  1. After phy_configure, call phy_power_on so the analog D-PHY's
+     timing registers and HHI_MIPI_CNTL are programmed before the
+     PHY_LOCK poll runs. The default mode_set flow runs
+     phy_ops->power_on AFTER dw_mipi_dsi_dphy_enable, which means
+     PHY_LOCK is being polled against an unprogrammed analog block.
+     phy_power_on is refcounted, so the later phy_ops->power_on call
+     reduces to a no-op refcount bump.
+
+  2. Drive the JTAG-style PHY_TST_CTRL0 / PHY_TST_CTRL1 sequence to
+     latch test register 0x44 = 0x74. Offsets 0xB4 / 0xB8 are the
+     standard Synopsys DW MIPI DSI test-control registers and sit in
+     the same MMIO region as the host registers.
+
+Signed-off-by: Joey Eamigh <55670930+JoeyEamigh@users.noreply.github.com>
+Upstream-Status: Pending
+---
+ drivers/gpu/drm/meson/meson_dw_mipi_dsi.c | 55 ++++++++++++++++++++++-
+ 1 file changed, 54 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c b/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c
+index 3fe2e9880..cce574db2 100644
+--- a/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c
++++ b/drivers/gpu/drm/meson/meson_dw_mipi_dsi.c
+@@ -149,13 +149,66 @@ static int dw_mipi_dsi_phy_init(void *priv_data)
+ 		       FIELD_PREP(MIPI_DSI_TOP_COMP0_SEL, 0),
+ 			mipi_dsi->base + MIPI_DSI_TOP_CNTL);
+
+-	return phy_configure(mipi_dsi->phy, &mipi_dsi->phy_opts);
++	ret = phy_configure(mipi_dsi->phy, &mipi_dsi->phy_opts);
++	if (ret)
++		return ret;
++
++	/*
++	 * Power the analog D-PHY on now, before dw_mipi_dsi_dphy_enable()
++	 * deasserts PHY_RSTZ and polls PHY_LOCK. The default mode_set flow
++	 * runs phy_ops->power_on AFTER dphy_enable, leaving HHI_MIPI_CNTL
++	 * and the analog D-PHY timing registers unprogrammed at the moment
++	 * lock is checked - PHY_LOCK then never asserts. phy_power_on is
++	 * refcounted, so the later call from phy_ops->power_on becomes a
++	 * no-op refcount bump.
++	 */
++	ret = phy_power_on(mipi_dsi->phy);
++	if (ret) {
++		dev_err(mipi_dsi->dev, "Failed to power on PHY (ret %d)\n", ret);
++		return ret;
++	}
++
++	/*
++	 * Program DW PHY internal test register 0x44 = 0x74 via the
++	 * JTAG-style TST_CTRL interface. This is a vendor calibration
++	 * latched into the DW PHY before PHY_RSTZ release; without it the
++	 * PHY does not lock for the configurations this glue driver hands
++	 * to dw-mipi-dsi.
++	 *
++	 *   TST_CTRL1[16] = testen, TST_CTRL1[7:0] = testdata
++	 *   TST_CTRL0[1]  = testclk
++	 *
++	 * A rising edge on testclk latches testdata as either the test
++	 * register address (testen=1) or a write to the previously selected
++	 * register (testen=0). Offsets 0xB4 / 0xB8 are the standard
++	 * Synopsys DW MIPI DSI PHY_TST_CTRL0 / PHY_TST_CTRL1; they sit in
++	 * the same MMIO region as the host registers.
++	 */
++	#define DW_DSI_PHY_TST_CTRL0	0xb4
++	#define DW_DSI_PHY_TST_CTRL1	0xb8
++
++	/* Select test register 0x44. */
++	writel_relaxed(0x00010044, mipi_dsi->base + DW_DSI_PHY_TST_CTRL1);
++	writel_relaxed(0x00000002, mipi_dsi->base + DW_DSI_PHY_TST_CTRL0);
++	writel_relaxed(0x00000000, mipi_dsi->base + DW_DSI_PHY_TST_CTRL0);
++	/* Write 0x74 to the selected register. */
++	writel_relaxed(0x00000074, mipi_dsi->base + DW_DSI_PHY_TST_CTRL1);
++	writel_relaxed(0x00000002, mipi_dsi->base + DW_DSI_PHY_TST_CTRL0);
++	writel_relaxed(0x00000000, mipi_dsi->base + DW_DSI_PHY_TST_CTRL0);
++
++	return 0;
+ }
+
+ static void dw_mipi_dsi_phy_power_on(void *priv_data)
+ {
+ 	struct meson_dw_mipi_dsi *mipi_dsi = priv_data;
+
++	/*
++	 * The first phy_power_on already happened inside
++	 * dw_mipi_dsi_phy_init() so the analog D-PHY was programmed
++	 * before PHY_LOCK was polled. This call is the bridge's
++	 * expected init/power_on pairing and reduces to a refcount bump.
++	 */
+ 	if (phy_power_on(mipi_dsi->phy))
+ 		dev_warn(mipi_dsi->dev, "Failed to power on PHY\n");
+ }
+--
+2.54.0
