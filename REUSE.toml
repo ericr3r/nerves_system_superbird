@@ -61,7 +61,7 @@ path = [
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "Various"
-SPDX-License-Identifier = "GPL-2.0-or-later"
+SPDX-License-Identifier = "GPL-2.0-only"
 
 # Fwup config files
 [[annotations]]
