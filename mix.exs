@@ -110,7 +110,6 @@ defmodule NervesSystemSuperbird.MixProject do
       "rootfs_overlay",
       "bootargs.txt",
       "fwup.conf",
-      "linux-7.0.defconfig",
       "mix.exs",
       "nerves_defconfig",
       "post-build.sh",
