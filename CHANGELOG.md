@@ -30,12 +30,15 @@ The old `linux-6.6.defconfig` and the 6.6-era squashfs readahead backport patch
 have been removed. The device tree overlay flow (watchdog/usb-host merged with
 `fdtoverlay` in `post-build.sh`) is unchanged.
 
-**Breaking: eMMC device path changed `/dev/mmcblk2` -> `/dev/mmcblk0`.** The
-mainline board device tree enables only the eMMC controller (`&sd_emmc_c`), so
-it now enumerates as `mmcblk0` instead of `mmcblk2`. `bootargs.txt`,
-`fwup_include/fwup-common.conf`, `rootfs_overlay/etc/erlinit.config`, and
-`rootfs_overlay/etc/fw_env.config` were all updated accordingly. Verify on first
-boot (`cat /proc/partitions`, `dmesg | grep mmc`).
+eMMC device path is preserved as `/dev/mmcblk2`. The mainline board device tree
+enables only the eMMC controller (`&sd_emmc_c`) and upstream aliases it to
+`mmc0`, which would make it enumerate as `mmcblk0`. To keep fwup/OTA device-path
+continuity with the 6.6 image (u-boot env, erlinit mounts, bootargs all encode
+`mmcblk2`), the generated base-DTS patch pins the alias to `mmc2 = &sd_emmc_c`
+(the block name `mmcblk%u` follows `card->host->index`, set from the DT `mmcN`
+alias). This is the only deliberate deviation from the upstream DTS; see
+`tools/gen-dts-patch.sh`. Still worth verifying on first boot
+(`cat /proc/partitions`, `dmesg | grep mmc`).
 
 See `docs/kernel-7.0-upgrade.md` for details and the yocto-sync procedure.
 
