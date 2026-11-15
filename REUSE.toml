@@ -52,7 +52,7 @@ path = [
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "Various"
-SPDX-License-Identifier = "GPL-2.0-only"
+SPDX-License-Identifier = "GPL-2.0-or-later"
 
 # Superbird board device tree - carries its own SPDX header upstream
 [[annotations]]
@@ -61,7 +61,7 @@ path = [
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "Various"
-SPDX-License-Identifier = "GPL-2.0-or-later OR MIT"
+SPDX-License-Identifier = "GPL-2.0-or-later"
 
 # Fwup config files
 [[annotations]]
